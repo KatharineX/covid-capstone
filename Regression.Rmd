@@ -1,0 +1,413 @@
+---
+title: "Regression"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Library
+```{r}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(tvReg)
+library(xgboost)
+library(readr)
+library(stringr)
+library(caret)
+library(car)
+library(cvTools)
+```
+
+# Import data
+```{r}
+mobility = read_csv("data/applemobilitytrends-2021-04-17.csv")
+covid = read_csv("data/latest_data.csv")
+flight_data = read_csv("data/flight_data.csv")
+#gov_response = read_csv("https://raw.githubusercontent.com/OxCGRT/covid-policy-tracker/master/data/OxCGRT_latest.csv")
+gov_response = read_csv("data/gov_response.csv")
+```
+
+# Data preprocessing
+```{r}
+# Changed clean mobility to only include countries
+cleaned_mobility = mobility[mobility$geo_type == "country/region",] %>% 
+  dplyr::select(-geo_type, -alternative_name, -`sub-region`, -country)  %>% 
+  gather(-transportation_type, -region,key = "date", value = "value") %>% 
+  group_by(region, date, transportation_type) %>% 
+  dplyr::slice(1) %>% 
+  ungroup() %>%  
+  pivot_wider(names_from = transportation_type, values_from = value ) %>% 
+  mutate(date = lubridate::as_date(date))
+
+# Read in and clean date column of government response data
+gov_response$Date = as.character(gov_response$Date)
+gov_response = gov_response %>% mutate(Date = lubridate::as_date(Date, format="%Y%m%d"))
+
+```
+
+# Select variable & Join
+```{r}
+gov_response = gov_response[, c("C1_School closing", "C2_Workplace closing", "C3_Cancel public events", "C4_Restrictions on gatherings", "C5_Close public transport","C6_Stay at home requirements", "C8_International travel controls", "E1_Income support", "E4_International support", "E2_Debt/contract relief", "H7_Vaccination policy", "H6_Facial Coverings", "H8_Protection of elderly people", "CountryName", "Date", "H1_Public information campaigns", "H2_Testing policy", "H3_Contact tracing", "H4_Emergency investment in healthcare", "C7_Restrictions on internal movement", "E3_Fiscal measures", "M1_Wildcard")]
+
+trial_data = covid %>% 
+  dplyr::select(reproduction_rate, location, date, population_density, median_age, aged_65_older) %>% 
+  inner_join(cleaned_mobility %>% dplyr::rename(location = "region"))
+```
+
+```{r}
+trial_data = merge(trial_data, gov_response, by.x = c("location", "date"), by.y = c("CountryName", "Date"))
+```
+
+# Smooth
+```{r}
+trial_data1 = trial_data %>% dplyr::select(-transit)
+trial_data1[is.na(trial_data1)] = 0
+
+
+scaled_trial_data = trial_data1 %>% group_by(location) %>%  group_modify(~mutate_if(.x, is.numeric, scale )) %>% as.data.frame()  
+
+
+wrapLowess <- function(y, f, dates) {
+  lowess_fit <- lowess(x = as.numeric(dates %>% lubridate::as_date()), y =  y, f = f)
+  lowess_fit$y
+}
+
+# Some countries have reported no cases: e.g. hong kong which we're just gonna exclude for now
+scaled_trial_data = scaled_trial_data %>% replace(is.na(scaled_trial_data), 0)
+
+smoothed_scaled_data = scaled_trial_data %>% group_by(location) %>%  group_modify(~mutate_if(.x, is.numeric,  wrapLowess,f = 0.05,.x$date )) %>% as.data.frame() 
+```
+
+# Calculate mean
+```{r}
+monthly_smoothed_scaled_data = smoothed_scaled_data  %>% group_by(location, month = lubridate::month(date, label=TRUE, abbr=TRUE), years = lubridate::year(date))  %>% summarise_if(is.numeric, mean)
+```
+
+# Manipulate flight_data so that it  can be joined
+```{r}
+date <- unlist(strsplit(flight_data$month,split=' '))
+month = date[seq(from=1, to=length(date)-1, by=2)]
+year = date[seq(from=2, to=length(date), by=2)]
+
+flight_data$month = month
+flight_data$year = year
+```
+
+```{r}
+monthly_smoothed_scaled_data$month = as.character(monthly_smoothed_scaled_data$month)
+monthly_smoothed_scaled_data$years = as.character(monthly_smoothed_scaled_data$years)
+```
+
+# Join flight_data dataset
+```{r}
+monthly_smoothed_scaled_data = merge(monthly_smoothed_scaled_data, flight_data, by.x = c("location", "month", "years"), by.y = c("country_name", "month", "year"))
+```
+
+# For median_age, aged_65_older, population_density, they should not be normalization
+```{r}
+for (country in unique(monthly_smoothed_scaled_data$location)) {
+  
+  median_age = trial_data1[which(trial_data1$location == country), "median_age"][1]
+  aged_65_older = trial_data1[which(trial_data1$location == country), "aged_65_older"][1]
+  population_density = trial_data1[which(trial_data1$location == country), "population_density"][1]
+  
+  monthly_smoothed_scaled_data[which(monthly_smoothed_scaled_data$location == country), "median_age"] = median_age
+  monthly_smoothed_scaled_data[which(monthly_smoothed_scaled_data$location == country), "aged_65_older"] = aged_65_older
+  monthly_smoothed_scaled_data[which(monthly_smoothed_scaled_data$location == country), "population_density"] = population_density
+  
+}
+
+
+```
+
+
+# Xgboost
+
+## tuning Tree Depth
+```{r}
+indexes = createDataPartition(smoothed_scaled_data$reproduction_rate, p = .75, list = F)
+
+xgdata_x = as.matrix(smoothed_scaled_data[, 7:28])
+xgdata_y = as.matrix(smoothed_scaled_data[, 3])
+
+cvK <- 3  # number of CV folds
+cv_RMSE_depth <- cv_RMSE <- c()
+
+for (i in 5:12) {
+  # cvSets里面是每个data对应的哪个fold
+  cvSets <- cvTools::cvFolds(nrow(xgdata_x), cvK)  # permute all the data, into 3 folds
+  
+  cv_RMSE <- NA  # initialise results vector
+  for (j in 1:cvK) {
+    test_id <- cvSets$subsets[cvSets$which == j]
+    train_x = xgdata_x[indexes, ]
+    test_x = xgdata_x[-indexes, ]
+
+    train_y = xgdata_y[indexes, ]
+    test_y = xgdata_y[-indexes, ]
+
+    xgb_train = xgb.DMatrix(data = train_x, label = train_y)
+    xgb_test = xgb.DMatrix(data = test_x, label = test_y)
+    
+    fit5 <- xgboost(data = xgb_train, max.depth = i, nrounds = 100, eta=0.3)
+    pred_y = predict(fit5, xgb_test)
+    cv_RMSE[j] <- caret::RMSE(test_y, pred_y)
+  }
+  cv_RMSE_depth <- append(cv_RMSE_depth, mean(cv_RMSE))
+}
+
+
+```
+
+```{r}
+plot(cv_RMSE_depth, x = 5:12, type = "o", xlab = "Tree Depth", ylab = "RMSE(log)", main = "Tree Depth VS RMSE(log)")
+```
+
+## tuning Rounds
+```{r}
+indexes = createDataPartition(smoothed_scaled_data$reproduction_rate, p = .85, list = F)
+
+train_x = xgdata_x[indexes, ]
+test_x = xgdata_x[-indexes, ]
+
+train_y = xgdata_y[indexes, ]
+test_y = xgdata_y[-indexes, ]
+
+xgb_train = xgb.DMatrix(data = train_x, label = train_y)
+xgb_test = xgb.DMatrix(data = test_x, label = test_y)
+    
+fit5 <- xgboost(data = xgb_train, max.depth = 9, nrounds = 700, eta=0.3)
+
+```
+
+```{r}
+plot(t(fit5$evaluation_log[,2]), x = 1:700, type = "o", xlab = "Rounds", ylab = "RMSE(log)", main = "Rounds VS RMSE(log)")
+```
+
+## Tuning learning rate
+```{r}
+cvK <- 3  # number of CV folds
+cv_RMSE_Lrate <- cv_RMSE <- c()
+# 重复50次CV
+for (i in seq(0.1, 0.7, 0.1)) {
+  # cvSets里面是每个data对应的哪个fold
+  cvSets <- cvTools::cvFolds(nrow(xgdata_x), cvK)  # permute all the data, into 3 folds
+  
+  cv_RMSE <- NA  # initialise results vector
+  for (j in 1:cvK) {
+    test_id <- cvSets$subsets[cvSets$which == j]
+    train_x = xgdata_x[indexes, ]
+    test_x = xgdata_x[-indexes, ]
+
+    train_y = xgdata_y[indexes, ]
+    test_y = xgdata_y[-indexes, ]
+
+    xgb_train = xgb.DMatrix(data = train_x, label = train_y)
+    xgb_test = xgb.DMatrix(data = test_x, label = test_y)
+    
+    fit5 <- xgboost(data = xgb_train, max.depth = 9, nrounds = 180, eta=i)
+    pred_y = predict(fit5, xgb_test)
+    cv_RMSE[j] <- caret::RMSE(test_y, pred_y)
+  }
+  cv_RMSE_Lrate <- append(cv_RMSE_Lrate, mean(cv_RMSE))
+}
+```
+
+```{r}
+plot(cv_RMSE_Lrate, x = seq(0.1, 0.7, 0.1), type = "o", xlab = "Learning Rate", ylab = "RMSE(log)", main = "Learning Rate VS RMSE(log)")
+```
+
+## Feature selection
+```{r}
+cvK <- 3  # number of CV folds
+cv_RMSE_F <- cv_RMSE <- c()
+# 重复50次CV
+for (i in 2:12) {
+  # cvSets里面是每个data对应的哪个fold
+  cvSets <- cvTools::cvFolds(nrow(xgdata_x), cvK)  # permute all the data, into 3 folds
+  
+  cv_RMSE <- NA  # initialise results vector
+  for (j in 1:cvK) {
+    test_id <- cvSets$subsets[cvSets$which == j]
+    train_x = xgdata_x[indexes, 1:i]
+    test_x = xgdata_x[-indexes, 1:i]
+
+    train_y = xgdata_y[indexes, ]
+    test_y = xgdata_y[-indexes, ]
+
+    xgb_train = xgb.DMatrix(data = train_x, label = train_y)
+    xgb_test = xgb.DMatrix(data = test_x, label = test_y)
+    
+    fit5 <- xgboost(data = xgb_train, max.depth = 9, nrounds = 100, eta=0.2)
+    pred_y = predict(fit5, xgb_test)
+    cv_RMSE[j] <- caret::RMSE(test_y, pred_y)
+  }
+  cv_RMSE_F <- append(cv_RMSE_F, mean(cv_RMSE))
+}
+
+```
+
+```{r}
+plot(cv_RMSE_F, x = seq(2+6, 12+6, 1), type = "o", xlab = "Variables", ylab = "RMSE(log)", main = "Variables VS RMSE(log)")
+```
+
+```{r}
+cvK <- 3  # number of CV folds
+cv_RMSE_F <- cv_RMSE <- c()
+# 重复50次CV
+for (i in 13:20) {
+  # cvSets里面是每个data对应的哪个fold
+  cvSets <- cvTools::cvFolds(nrow(xgdata_x), cvK)  # permute all the data, into 3 folds
+  
+  cv_RMSE <- NA  # initialise results vector
+  for (j in 1:cvK) {
+    test_id <- cvSets$subsets[cvSets$which == j]
+    train_x = xgdata_x[indexes, 1:i]
+    test_x = xgdata_x[-indexes, 1:i]
+
+    train_y = xgdata_y[indexes, ]
+    test_y = xgdata_y[-indexes, ]
+
+    xgb_train = xgb.DMatrix(data = train_x, label = train_y)
+    xgb_test = xgb.DMatrix(data = test_x, label = test_y)
+    
+    fit5 <- xgboost(data = xgb_train, max.depth = 9, nrounds = 100, eta=0.2)
+    pred_y = predict(fit5, xgb_test)
+    cv_RMSE[j] <- caret::RMSE(test_y, pred_y)
+  }
+  cv_RMSE_F <- append(cv_RMSE_F, mean(cv_RMSE))
+}
+
+```
+
+```{r}
+plot(cv_RMSE_F, x = seq(13+6, 20+6, 1), type = "o", xlab = "Variables", ylab = "RMSE(log)", main = "Variables VS RMSE(log)")
+```
+
+## Monthly or not 
+```{r}
+xgdata_x = as.matrix(smoothed_scaled_data[, 7:21])
+xgdata_y = as.matrix(smoothed_scaled_data[, 3])
+
+train_x = xgdata_x[indexes, ]
+test_x = xgdata_x[-indexes, ]
+
+train_y = xgdata_y[indexes, ]
+test_y = xgdata_y[-indexes, ]
+
+xgb_train = xgb.DMatrix(data = train_x, label = train_y)
+xgb_test = xgb.DMatrix(data = test_x, label = test_y)
+
+xgbc = xgboost(data = xgb_train, max.depth = 9, nrounds = 180, eta=0.2)
+
+pred_y = predict(xgbc, xgb_test)
+
+mse = mean((test_y - pred_y)^2)
+mae = caret::MAE(test_y, pred_y)
+rmse = caret::RMSE(test_y, pred_y)
+
+cat("MSE: ", mse, "MAE: ", mae, " RMSE: ", rmse)
+```
+
+
+```{r}
+xgdata_x = as.matrix(monthly_smoothed_scaled_data[, 5:31])
+xgdata_y = as.matrix(monthly_smoothed_scaled_data[, 4])
+
+indexes = createDataPartition(monthly_smoothed_scaled_data$reproduction_rate, p = .85, list = F)
+train_x = xgdata_x[indexes, ]
+test_x = xgdata_x[-indexes, ]
+
+train_y = xgdata_y[indexes, ]
+test_y = xgdata_y[-indexes, ]
+
+xgb_train = xgb.DMatrix(data = train_x, label = train_y)
+xgb_test = xgb.DMatrix(data = test_x, label = test_y)
+
+xgbc = xgboost(data = xgb_train, max.depth = 9, nrounds = 180, eta=0.2)
+
+pred_y = predict(xgbc, xgb_test)
+
+mse = mean((test_y - pred_y)^2)
+mae = caret::MAE(test_y, pred_y)
+rmse = caret::RMSE(test_y, pred_y)
+
+cat("MSE: ", mse, "MAE: ", mae, " RMSE: ", rmse)
+```
+
+# Calculate the square & cubic of each variable  
+```{r}
+square = monthly_smoothed_scaled_data
+cubic = monthly_smoothed_scaled_data
+biquadratic = monthly_smoothed_scaled_data
+fifth_time = monthly_smoothed_scaled_data
+sixth_time = monthly_smoothed_scaled_data
+seventh_time = monthly_smoothed_scaled_data
+eighth_time = monthly_smoothed_scaled_data
+ninth_time = monthly_smoothed_scaled_data
+tenth_time = monthly_smoothed_scaled_data
+log_transformation = monthly_smoothed_scaled_data
+exponential_transformation = monthly_smoothed_scaled_data
+fraction = monthly_smoothed_scaled_data
+
+for (column in colnames(monthly_smoothed_scaled_data)[5:31]) {
+  square[,paste(column, "Square")] = monthly_smoothed_scaled_data[,column]^2
+  cubic[,paste(column, "Cubic")] = monthly_smoothed_scaled_data[,column]^3
+  biquadratic[,paste(column, "Biquadratic")] = monthly_smoothed_scaled_data[,column]^4
+  fifth_time[,paste(column, "Fifth")] = monthly_smoothed_scaled_data[,column]^5
+  sixth_time[,paste(column, "Sixth")] = monthly_smoothed_scaled_data[,column]^6
+  seventh_time[,paste(column, "Seventh")] = monthly_smoothed_scaled_data[,column]^7
+  eighth_time[,paste(column, "Eighth")] = monthly_smoothed_scaled_data[,column]^8
+  ninth_time[,paste(column, "Ninth")] = monthly_smoothed_scaled_data[,column]^9
+  tenth_time[,paste(column, "Tenth")] = monthly_smoothed_scaled_data[,column]^10
+  log_transformation[,paste(column, "Log")] = log(monthly_smoothed_scaled_data[,column])
+  exponential_transformation[,paste(column, "E")] = exp(monthly_smoothed_scaled_data[,column])
+  fraction[,paste(column, "F")] = 1/monthly_smoothed_scaled_data[,column]
+  
+}
+
+
+```
+
+```{r}
+# fraction = fraction %>% replace(fraction == Inf, 1)
+# log_transformation[, 32:58]
+```
+
+# Join
+```{r}
+monthly_smoothed_scaled_data = cbind(monthly_smoothed_scaled_data, square[,32:58], cubic[,32:58], biquadratic[,32:58], fifth_time[,32:58], sixth_time[, 32:58], seventh_time[, 32:58], eighth_time[, 32:58], ninth_time[, 32:58], tenth_time[, 32:58], exponential_transformation[, 32:58], fraction[, 32:58], log_transformation[, 32:58])
+```
+
+```{r}
+monthly_smoothed_scaled_data = monthly_smoothed_scaled_data %>% replace(monthly_smoothed_scaled_data == Inf | monthly_smoothed_scaled_data == NaN, 0)
+```
+
+# Stepwise Regression
+```{r}
+# fit = step(lm(formula = reproduction_rate ~ ., data = monthly_smoothed_scaled_data[, c(4:301)]), direction = "backward")
+
+# Full model
+fit_full <- lm(formula = reproduction_rate ~ ., data = monthly_smoothed_scaled_data[, c(4:328)])
+# Null model
+fit_null <- lm(formula = reproduction_rate ~ 1, data = monthly_smoothed_scaled_data[, c(4:328)])
+
+# Forwards step-wise regression
+fit = step(lm(formula = reproduction_rate ~ 1, data = monthly_smoothed_scaled_data[, c(4:328)]), direction = "forward", scope = list(lower = fit_null, 
+    upper = fit_full))
+
+```
+
+# Performance
+```{r}
+# Because we are not doing any prediction here, I decided not to split train_test_set and calculating MSE for test_set
+# We are only interested in the performance of the model, whether it is good at prediction or not is not so important.
+
+summary(fit)
+mse = sum(residuals(fit)^2)/680
+mse
+```
