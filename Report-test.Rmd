@@ -1,0 +1,1702 @@
+---
+title: "DATA3888 Report"
+author: "Health C2"
+date: "11/06/2021"
+output: 
+  rmdformats::robobook:
+    code_folding: hide
+    fig_caption: yes
+    number_sections: no
+    self_contained: yes
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+
+
+```{=html}
+<style>
+  .superbigimage{
+      overflow-x:scroll;
+      white-space: nowrap;
+  }
+
+  .superbigimage img{
+     max-width: none;
+  }
+
+
+</style>
+```
+
+```{r, include=FALSE}
+# Load all required packages
+#install.packages('rmdformats')
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+library(tvReg)
+library(xgboost)
+library(readr)
+library(stringr)
+library(caret)
+library(car)
+library(cvTools)
+library(randomForest)
+library(e1071)
+library(deSolve)
+library(Metrics)
+library(lubridate)
+library(heatmaply)
+library(naniar)
+library(pheatmap)
+library(stats)
+library(zoo)
+library(viridis)
+library(lubridate)
+library(Metrics)
+library(DT)
+library(formattable)
+```
+
+# Executive Summary
+
+## Background & Motivation
+Covid-19 highlighted numerous issues with government policy and pandemic responses worldwide. With 3.7 million deaths globally, it crucial that epidemiologists and policy makers collaborate to implement policies that de-escalate the spread of the virus. With each country having divergent responses to contain the spread of the pandemic, we believe that it is essential that epidemiologists consider and simulate the effect of these policies to understand what the optimal response was at different points of time. Additionally, in understanding which strategies succeed and fail, governments can implement more effective response in dealing with future outbreaks.
+
+## Main Findings
+Our key findings orientated around the effects of policy implementation. We found that policies can have varying effects depending on the time and country they were implemented in. However, we found that the use of mask mandates and international travel restrictions consistently reduced the spread of the virus by a substantial level. 
+
+## Project Overview
+We developed a Covid-19 policy simulation dashboard to present a multifaceted analysis of the impact of different policies on the spread of the virus. We use a range of techniques from clustering, to simulation and time-varying regression.
+
+From clustering, we can group countries based on their similarities moving between different time frames, highlighting which countries diverged in their Covid-19 timelines. The insights from this process can be investigated to identify policies that appropriately handled the outbreak to use in our simulation tool. 
+
+Similarly, by looking at the time varying coefficients in our regression model and simulation, epidemiologists can understand the impact of different factors in influencing the scale of the outbreak during different periods of time.
+
+This interaction of these techniques is visualised below:
+
+![Figure 1: Project Flowchart](images/project_flowchart.png)
+
+## Practical Relevance of the Analysis 
+
+We analysed the diverse policies implemented by 10 countries. Our findings are only directly applicable to these nations. However, since these locations are diverse and capture a large proportion of the propagation of the virus, our results can likely generalise to regions outside these 10.
+
+Covid-19 and other outbreaks are spontaneous, so it is difficult to foresee its future spread. Despite this, our retrospective analysis is still relevant to policy makers as it still provides them a baseline of which they can make data-driven decisions. By juxtaposing present and prior conditions, these individuals will be able to determine when our simulation analysis is appropriate and deduce an effective strategy to prevent an outbreak. 
+
+# Datasets
+
+The following datasets were used in the analysis for our project. A detailed index of all variables for each dataset can be found in Appendix ABC.
+
+## Our World in Data (OWID) COVID Data
+
+This dataset contains daily records of Covid-19 specific variables. For our analysis we used the `reproduction_rate` (spread of the virus) and the number of Covid-19 `new_cases` per day.
+
+## Oxford Covid 19 Government Response Covid Policy Tracker Data (OxCGRT)
+
+The OxCGR dataset is curated by the Blavatnik School of Government and collects daily systematic information of every country’s government response and measures against the pandemic. There 20+ indicators, ranging from healthcare policies to closure and economic policies. A `flag` variable is included to indicate the geographic scale of the policy. Each of these variables are ordinal or binary. 
+
+## Apple COVID 19 Mobility Trends Data
+
+This data consists of daily updates on the level of walking, driving and use of public transport in each country relative to their baseline level. Data is sent from apple user devices to their Maps service and random, rotating identifiers are used to maintain anonymity. 
+
+## Flight Mobility dataset
+
+The flight mobility dataset was created by joining multiple CSV files from an open source air traffic data organisation (OpenSky Network). The pre-processing steps to create this CSV are outlined in Appendix XYZ. It contains the number of daily `flight_in` and `flights_out` for each country.
+
+
+## Flight Mobility dataset
+
+The flight mobility dataset was created by joining multiple CSV files sourced from Zenodo. The data originally comes from the OpenSky Network, an organisation which provide open source air traffic data for research purposes. To create the CSV file used in our analysis, a number of preprocessing steps had to be performed (see *Appendix*). 
+
+# Data Cleaning
+
+For each dataset, we converted all columns to the appropriate datatype (e.g. date column to date type). Only variables required for our analysis were retained and we filtered the dataset to 10 countries (see appendix for these variables and countries)  from 2020-03-01 to 2021-03-01. Government policy variables with >50% missing values were dropped and 0 was imputed for the `new_case` variable when missing values were recorded. Most countries had missing values for public transport mobility and thus was dropped. These steps minimised the removal of observations with missing values. Columns were renamed for consistency and the datasets were joined based on location and date. 
+
+```{r}
+# Read in covid data and convert date column to be of type Date
+latest_data = read_csv("data/latest_data.csv")
+covid = latest_data %>% mutate(date = lubridate::as_date(date))
+
+# Read in mobility data 
+# Format the data so that driving and walking are columns (convert from wide to long)
+mobility = read_csv("data/applemobilitytrends-2021-04-17.csv") 
+cleaned_mobility = mobility[mobility$geo_type == "country/region",] %>% 
+  dplyr::select(-geo_type, -alternative_name, -`sub-region`, -country)  %>% 
+  gather(-transportation_type, -region,key = "date", value = "value") %>% 
+  group_by(region, date, transportation_type) %>% 
+  dplyr::slice(1) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = transportation_type, values_from = value ) %>% mutate(date = lubridate::as_date(date))
+
+# Join the COVID and mobility datasets on location and date
+data_joined = merge(covid, cleaned_mobility, by.x = c("location", "date"), by.y = c("region", "date"))
+
+# Read in and format the Flight Data
+# Group by month and country, taking the average flights in and flights out
+flight_data = read_csv("data/flight_data.csv") %>% 
+  mutate(day = lubridate::as_date(day)) %>% 
+  mutate(year = year(day), month = lubridate::month(day)) %>% 
+  group_by(location = country_name, month, year) %>% 
+  group_modify(~ .x %>% 
+                 mutate(flights_out = mean(flights_out), flights_in = mean(flights_in)) %>% 
+                 dplyr::slice(1)) %>% 
+  ungroup()
+
+# Make label for flight data consisting of country, month and year
+flight_data = flight_data %>% 
+  mutate(label = paste(country_name, year, month )) %>% 
+  dplyr::select(label, flights_in, flights_out)
+
+# Select columns of interest from the joined COVID and mobility data
+subset_columns = c("location", "date","reproduction_rate","new_cases_smoothed_per_million", "new_vaccinations_smoothed", "median_age", "gdp_per_capita", "population_density", "human_development_index", "driving", "walking")
+df = data_joined %>% select(subset_columns) 
+
+# Make a summarised data frame grouped by month, year and location
+# Join this data frame to the previously prepared flight data
+df_summ = df %>% 
+  group_by(location, m = lubridate::month(date), y = lubridate::year(date)) %>% 
+  summarise_all(mean, na.rm = TRUE)  %>% 
+  mutate(label = paste(location, y, m)) %>% 
+  inner_join(flight_data)
+
+# Filter the data to certain countries which have data
+# Replace NAs with 0s
+# Order in terms of year, month and location
+countries <- c("Brazil", "Germany", "Australia", "United Kingdom", "Italy", "New Zealand","United States", "Spain", "Singapore", "India", "Japan", "Norway")
+df_summ_filtered = df_summ %>% 
+  filter(m >= 3|y == 2021, location %in% countries) %>%  
+  ungroup() %>% 
+  arrange(y,m, location) %>% 
+  select(-date,-y, -m, -location) %>% 
+  replace(is.na(.), 0) 
+
+# Read in and clean date column of government response data
+# Also rename location for joining
+gov_response = read_csv("data/gov_response.csv") %>% 
+  janitor::clean_names() %>% 
+  mutate(date = as_date(as.character(date), format="%Y%m%d")) %>% 
+  rename(location = "country_name")
+
+# Rename all government response variables
+
+gov_response_renamed <- gov_response %>% janitor::clean_names() 
+
+# Closure policies
+names(gov_response_renamed)[names(gov_response_renamed) == 'c1_school_closing'] <- "School_Closing"
+names(gov_response_renamed)[names(gov_response_renamed) == 'c1_flag'] <- "School_Closing_Geographic_Scope"
+names(gov_response_renamed)[names(gov_response_renamed) == 'c2_workplace_closing'] <- "Work_Closing"
+names(gov_response_renamed)[names(gov_response_renamed) == 'c2_flag'] <- "Work_Closing_Geographic_Scope"
+names(gov_response_renamed)[names(gov_response_renamed) == 'c3_cancel_public_events'] <- "Cancel_Public_Events"
+names(gov_response_renamed)[names(gov_response_renamed) == 'c3_flag'] <- "Cancel_Public_Events_Geographic_Scope"
+names(gov_response_renamed)[names(gov_response_renamed) == 'c4_restrictions_on_gatherings'] <- "Restrictions_On_Gatherings"
+names(gov_response_renamed)[names(gov_response_renamed) == 'c4_flag'] <- "Restrictions_On_Gatherings_Geographic_Scope"
+names(gov_response_renamed)[names(gov_response_renamed) == 'c5_close_public_transport'] <- "Close_Public_Transport"
+names(gov_response_renamed)[names(gov_response_renamed) == 'c5_flag'] <- "Close_Public_Transport_Geographic_Scope"
+names(gov_response_renamed)[names(gov_response_renamed) == 'c6_stay_at_home_requirements'] <- "Stay_At_Home_Requirements"
+names(gov_response_renamed)[names(gov_response_renamed) == 'c6_flag'] <- "Stay_At_Home_Requirements_Geographic_Scope"
+names(gov_response_renamed)[names(gov_response_renamed) == 'c7_restrictions_on_internal_movement'] <- "Internal_Movement_Restrictions"
+names(gov_response_renamed)[names(gov_response_renamed) == 'c7_flag'] <- "Internal_Movement_Restrictions_Geographic_Scope"
+names(gov_response_renamed)[names(gov_response_renamed) == 'c8_international_travel_controls'] <- "International_Travel_Controls"
+
+# Economic policies
+names(gov_response_renamed)[names(gov_response_renamed) == 'e1_income_support'] <- "Income_Support"
+names(gov_response_renamed)[names(gov_response_renamed) == 'e1_flag'] <- "Income_Support_Sectoral_Scope"
+names(gov_response_renamed)[names(gov_response_renamed) == 'e2_debt_contract_relief'] <- "Debt_Contract_Relief"
+names(gov_response_renamed)[names(gov_response_renamed) == 'e3_fiscal_measures'] <- "Fiscal_Measures"
+names(gov_response_renamed)[names(gov_response_renamed) == 'e4_international_support'] <- "International_Support"
+
+# Health
+names(gov_response_renamed)[names(gov_response_renamed) == 'h1_public_information_campaigns'] <- "Public_Info_Campaigns"
+names(gov_response_renamed)[names(gov_response_renamed) == 'h1_flag'] <- "Public_Info_Campaigns_Geographic_Scope"
+names(gov_response_renamed)[names(gov_response_renamed) == 'h2_testing_policy'] <- "Testing_Policy"
+names(gov_response_renamed)[names(gov_response_renamed) == 'h3_contact_tracing'] <- "Contact_Tracing"
+names(gov_response_renamed)[names(gov_response_renamed) == 'h4_emergency_investment_in_healthcare'] <- "Emergency_Investment_Healthcare"
+names(gov_response_renamed)[names(gov_response_renamed) == 'h5_investment_in_vaccines'] <- "Investment_Vaccine"
+names(gov_response_renamed)[names(gov_response_renamed) == 'h6_facial_coverings'] <- "Facial_Coverings"
+names(gov_response_renamed)[names(gov_response_renamed) == 'h6_flag'] <- "Facial_Coverings_Geographic_Scope"
+names(gov_response_renamed)[names(gov_response_renamed) == 'h7_vaccination_policy'] <- "Vaccination_Policy"
+names(gov_response_renamed)[names(gov_response_renamed) == 'h7_flag'] <- "Cost_Binary_Flag"
+names(gov_response_renamed)[names(gov_response_renamed) == 'h8_protection_of_elderly_people'] <- "Elderly_Protection"
+names(gov_response_renamed)[names(gov_response_renamed) == 'h8_flag'] <- "Elderly_Protection_Geographic_Scope"
+
+# Only consider entries after the first of March 2020
+gov_response_subsetted = gov_response_renamed[,c(1,c(6:39), 42)] %>% 
+  filter(date >= "2020-03-01")
+
+# Function to find the mode
+Mode <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+# Group the government response data on month, year and location
+# Use the mode to determine the policy value for the given country, month and year
+gov_summary = gov_response_subsetted %>% 
+  group_by(location,month = month(date)) %>% 
+  group_modify(~  mutate(.x, stringency_index = mean(stringency_index)) %>% 
+                 mutate_all(Mode)) %>% 
+  dplyr::slice(1)
+
+# Add label to government grouped data with country, month and year
+# Remove unnecessary columns
+gov_summary = gov_summary %>% 
+  mutate(label = paste(location, year(date), month), year = year(date)) %>% 
+  select(-m1_wildcard, -date) 
+
+# Make combined data frame with COVID, mobility and government response data
+df_gov = df_summ_filtered %>% 
+  left_join(gov_summary, by = "label")
+
+df_full = df_gov
+
+# Change format of policy variable names
+
+# Closure policies
+closure_policies_new = c("School_Closing","School_Closing_Geographic_Scope","Work_Closing","Work_Closing_Geographic_Scope","Cancel_Public_Events",                           
+                         "Cancel_Public_Events_Geographic_Scope","Restrictions_On_Gatherings","Restrictions_On_Gatherings_Geographic_Scope","Close_Public_Transport",
+                         "Close_Public_Transport_Geographic_Scope","Stay_At_Home_Requirements","Stay_At_Home_Requirements_Geographic_Scope","Internal_Movement_Restrictions",
+                         "Internal_Movement_Restrictions_Geographic_Scope", "International_Travel_Controls" ) %>% lapply(function(x) gsub(pattern = "_", " ",x)) %>% unlist()
+# Economic policies
+economic_policies_new = c("Income_Support","Income_Support_Sectoral_Scope","Debt_Contract_Relief","Fiscal_Measures",
+                          "International_Support") %>% lapply(function(x) gsub(pattern = "_", " ",x)) %>% unlist()
+# Health system policies
+health_policies_new = c("Public_Info_Campaigns","Public_Info_Campaigns_Geographic_Scope","Testing_Policy","Contact_Tracing",
+                        "Emergency_Investment_Healthcare",                 
+                        "Investment_Vaccine","Facial_Coverings","Facial_Coverings_Geographic_Scope",
+                        "Vaccination_Policy","Cost_Binary_Flag","Elderly_Protection",
+                        "Elderly_Protection_Geographic_Scope") %>% lapply(function(x) gsub(pattern = "_", " ",x)) %>% unlist()
+
+
+df_policy = df_full[,c(10,13:48)]
+colnames(df_policy) = lapply(colnames(df_policy),function(x) gsub(pattern = "_", " ",x)) %>% unlist()
+
+# Choice of countries for clustering
+countries <- c("Germany", "Australia", "United Kingdom", "Italy", "New Zealand","United States", "Spain", "India", "Japan", "Norway")
+
+# Choice of variables for clustering
+subset_columns = c("location", "date","new_cases_smoothed_per_million","reproduction_rate", "new_vaccinations_smoothed", "driving", "walking", "median_age", "gdp_per_capita", "population_density", "human_development_index")
+
+# Filtering and joining data for scaling
+df = data_joined %>% select(subset_columns) 
+df_summ = df %>% group_by(location, m = lubridate::month(date), y = lubridate::year(date)) %>% summarise_all(mean, na.rm = TRUE)  %>% mutate(label = paste(location, y, m))  %>% ungroup() %>% inner_join(flight_data)
+df_summ_filtered = df_summ %>% filter(m >= 3|y == 2021, location %in% countries) %>%  ungroup()  %>% arrange(y,m, location) %>% select(-date,-y, -m, -location)  %>% replace(is.na(.), 0) 
+
+# Scale data
+min_max_scale = function(x){
+  (x - min(x))/(max(x) - min(x))
+}
+
+scaled_data = df_summ_filtered %>% mutate_if(is.numeric,min_max_scale ) %>%  column_to_rownames("label") %>% select(-human_development_index,-median_age, -gdp_per_capita, -population_density)
+
+# Join flight data to COVID and mobility data
+fd2j = read_csv("data/flight_data.csv") %>% mutate(date = lubridate::as_date(day)) %>% select(date = day, location = country_name, flights_out, flights_in)
+full_data = data_joined %>% inner_join(fd2j) %>% select(colnames(scaled_data), location,date) %>% mutate(new_vaccinations_smoothed = ifelse(is.na(new_vaccinations_smoothed), 0, new_vaccinations_smoothed))
+
+# Cleaned Clustering Data
+colnames(scaled_data)[1] = "new_cases_per_million"
+scaled_data = scaled_data %>% select(-flights_out)
+colnames(scaled_data) = colnames(scaled_data) %>% str_replace_all("_", " ") %>% str_replace_all("smoothed", "")%>%  str_to_title()
+dist_scaled_data = dist(scaled_data)
+```
+
+# Method
+For our project we utilised 3 techniques to understand the impact of policies and mobility factors in the spread of Covid-19.
+
+## Clustering
+
+To provide epidemiologists with potential policies to consider, we identified countries that initially started off on a similar trajectory but then diverged over time. We speculated that this change was due to varying policy responses.
+Hierarchical clustering was used to group countries on a monthly basis using `new_cases`, `reproduction_rate`, `vaccination_rates`, `flights_in`, `walking` and ` driving` into 8 clusters. For each country all variables were averaged over a month, min-max scaled and compared using Euclidian distance.
+
+Countries (on a specific month) initially in the same similar cluster but then changed maximally in terms of Euclidian distance in the following month were identified. These countries were labelled as "worse" if new cases were higher relative to the chosen country, otherwise "better".
+
+A policy recommendation table was then constructed from these retained countries to show the differences in each countries most frequent policy for the month. From this, epidemiologists could consider which policies may be effective and those that may not.
+
+
+
+## Simulation
+
+Epidemiologist are concerned with the spread and management of epidemics. By employing simulation, they can observe the estimated trajectory of the COVID-19 pandemic given a choice of policy. The SIR (Susceptible, Infected, Recovered) model is robust and popular system of ordinary differential equations which models the spread of disease.
+
+$$\frac{dS}{dt} = -\beta SI$$
+$$\frac{dI}{dt} = \beta SI - \gamma I$$
+$$\frac{dR}{dt} = \gamma I$$
+
+However, it's important to recognise that not all diseases have the same characteristics of transmission and recovery. Thus, the individual nature of the disease is captured in the value of the parameters we select.
+
+$$\beta = \textrm{infection parameter.}$$
+$$\gamma = \textrm{recovery parameter.}$$
+
+The basic spread of an epidemic can be illustrated as the ratio between the spread of the infection and the rate of recovery. As such, the reproduction number is defined as:
+
+$$R_{0} = \frac{\beta}{\gamma}$$ 
+
+Fundamentally, $R_{0} > 1$ indicates an increase in the spread of the epidemic, and $R_{0} < 1$ indicates a reduction in the spread of the pandemic.
+
+<!-- Example of SIR model, where deSolver package ode() function solves system of ODES -->
+<!-- ```{r} -->
+<!-- init <- c(S = 1-1e-6, I = 1e-6, R = 0.0) -->
+<!-- parameters <- c(beta = 1.4247, gamma = 0.14286) -->
+<!-- times <- seq(0, 70, by = 1) -->
+<!-- out <- ode(y = init, times = times, func = sir, parms = parameters) -->
+<!-- out <- as.data.frame(out) -->
+<!-- out$time <- NULL -->
+<!-- matplot(x = times, y = out, type = "l", -->
+<!--         xlab = "Time", ylab = "Susceptible and Recovered", main = "SIR Model", -->
+<!--         lwd = 1, lty = 1, bty = "l", col = 2:4) -->
+<!-- nn <- ncol(out) -->
+<!-- legend("right", colnames(out),col=seq_len(nn),cex=0.8,fill=seq_len(nn)) -->
+<!-- ``` -->
+
+<!-- We can include a basic example if we want... may be harder to wiggle out out of proportion vs new cases if we do tho :) -->
+
+Although being aware of the current epidemic trajectory is important, our model aims to provide even greater value through its trajectory of the epidemic given the implementation of a new policy. By adjusting the value of the reproduction rate at a particular date, we can effectively simulate the introduction of a policy that has reduced the spread of the virus. Since the reproduction rate is the relationship between two parameters, we implemented a new $R_{0}$ by manipulating the model parameters. As policy implementations don't affect the ability of individuals to recover from the disease ($\gamma$), our approach was to manipulate the infection parameter ($\beta$). Therefore, our model is based off the following:
+
+$$\beta_{0} = \frac{R_{0}}{\gamma}$$
+$$\beta_{1} = \frac{R_{1}}{\gamma}$$
+
+To produce a result, our model will run separate simulations and return results based on these parameters. We introduce a delay of 1 day to represent a lag in the effect of the policy. 
+
+```{r}
+epiModel <- function(initpars, newpars, timechange, population, current_infected){
+
+    ## Additional parameters
+  #to = timechange
+    init_times <- seq(from = 0, to = timechange, by = 1)
+    yinit <- c(Susc = 1 - current_infected/population, Infected = current_infected/population, Recovered = 0) # this parameter sets the initial conditions
+
+    ## below is the code for the actual model including the equations from before
+    SIR_model <- function(times, yinit, initpars){
+
+    with(as.list(c(yinit,initpars)), {
+      
+            beta = reproduction_rate*recovery
+
+            dSusc      <- - beta*Infected*Susc                     
+            dInfected  <-   beta*Infected*Susc - recovery*Infected 
+            dRecovered <-   recovery*Infected
+
+            return(list(c(dSusc, dInfected, dRecovered)))})
+    }
+
+    ## run the ode solver for the function specified (function defined above is used)
+    ## return the value of each compartment (Susc, Infected, Recovered) for each time step.
+    results1 <- ode(func = SIR_model, times = init_times, y = yinit, parms = initpars)
+    results1 <- results1 %>% as.data.frame()
+
+    
+    ## Post policy involves same process for new R0 value.
+    
+    new_times <- seq(from = timechange, to = 30, by = 1)
+    ynew <- c(Susc = results1[which(results1$time == timechange), "Susc"], Infected = results1[which(results1$time == timechange), "Infected"], Recovered = results1[which(results1$time == timechange), "Recovered"])
+    
+    SIR_model <- function(new_times, ynew, new_pars, population, current_infected){
+
+    with(as.list(c(ynew,new_pars)), {
+      
+            beta = reproduction_rate*recovery
+
+            dSusc      <- - beta*Infected*Susc                     
+            dInfected  <-   beta*Infected*Susc - recovery*Infected 
+            dRecovered <-   recovery*Infected
+
+            return(list(c(dSusc, dInfected, dRecovered)))})
+    }
+    
+    results2 <- ode(func = SIR_model, times = new_times, y = ynew, parms = newpars)
+    results2 <- results2 %>% as.data.frame()
+    
+    results <- as.data.frame(rbind(results1, results2))
+    results <- as.data.frame(results[-c(timechange+1),])
+  
+    
+    proj_times <- seq(from = 0, to = 30, by = 1) 
+    yinit <- c(Susc =  1 - current_infected/population, Infected = current_infected/population, Recovered = 0) # this parameter sets the initial conditions
+
+    ## below is the code for the actual model including the equations that you should recognize
+    SIR_model <- function(times, yinit, initpars, population, current_infected){
+
+    with(as.list(c(yinit,initpars)), {
+      
+            beta = reproduction_rate*recovery
+
+            dSusc      <- - beta*Infected*Susc                     
+            dInfected  <-   beta*Infected*Susc - recovery*Infected 
+            dRecovered <-   recovery*Infected
+
+            return(list(c(dSusc, dInfected, dRecovered)))})
+    }
+
+    ## run the ode solver for the function specified (function defined above is used)
+    ## return the value of each compartment (Susc, Infected, Recovered) for each time step.
+    results3 <- ode(func = SIR_model, times = proj_times, y = yinit, parms = initpars)
+    results3 <- results3 %>% as.data.frame()
+    
+    colnames(results3) <- c("time2","SuscProj", "InfectedProj", "RecoveredProj")
+    results <- as.data.frame(cbind(results, results3))
+    
+    return(results)
+    
+}
+
+
+```
+
+```{r}
+simulation <- function (data, selected_date, policy_RR, country, trueProj=FALSE, accuracy=FALSE, recovery = 0.074, difference = FALSE, lower=FALSE, upper=FALSE) {
+  
+  filt_data <- data %>% filter(location==country, date <= selected_date, date > as.Date(selected_date)-31) 
+  new_case_dat <- filt_data %>% select(new_cases)
+  
+  RR <- filt_data %>% select(reproduction_rate) %>% tail(n=1) %>% dplyr::pull(reproduction_rate)
+  if (upper == TRUE){
+    RR <- RR + 0.02
+  }
+  
+  if (lower == TRUE){
+    RR <- RR - 0.02
+  }
+  
+  cPop <- filt_data %>% select(population)%>% head(n=1) %>% dplyr::pull(population)
+  current_infected <- new_case_dat %>% tail(n=1) %>% dplyr::pull(new_cases)
+
+  
+  inital_pars <- c(reproduction_rate = RR, recovery = recovery)
+  policy_pars <- c(reproduction_rate = policy_RR, recovery = recovery)
+  
+  results <- epiModel(inital_pars,policy_pars, timechange = 1, population = cPop, current_infected = current_infected) 
+  results$Infected <- results$Infected*cPop
+  results$InfectedProj <- results$InfectedProj*cPop
+  
+  caseDiff = sum(-results$Infected + results$InfectedProj)
+  if (difference == TRUE){
+      return(caseDiff)
+  }
+
+  
+  results = results
+  
+  labCol <- rep(NA,31)
+  
+  init_df = data.frame(new_case_dat, labCol, labCol)
+  colnames(init_df) <- c("New_Cases", "Projected_Cases", "Policy_cases")
+  
+  labCol2 <- rep(NA,31)
+  
+  sec_df = data.frame(labCol2, results$Infected, results$InfectedProj)
+  colnames(sec_df) <- c("New_Cases", "Projected_Cases", "Policy_cases")
+  
+  totalRes <- rbind(init_df, sec_df)
+  
+  date_time <- seq(as.Date(selected_date)-30, as.Date(selected_date)+31, 1)
+  
+  
+  time <- seq(as.Date(selected_date)-30, as.Date(selected_date)+31, 1)
+  time <- data.frame(time)
+  totalRes <- cbind(time, totalRes)
+  
+  if (trueProj == TRUE){
+  fil_data <- data %>% filter(location==country, date <= as.Date(selected_date)+31, date > as.Date(selected_date)-31)
+  new_case_dat <- fil_data %>% dplyr::pull(new_cases)
+  new_case_dat <- dplyr::case_when(new_case_dat < 0 ~ 0,
+                                   TRUE ~ as.double(new_case_dat)
+  )
+  totalRes$New_Cases <- new_case_dat
+  }
+  
+  future_Dat <- totalRes %>% filter(time > selected_date)
+  avg_err <- mean(abs(future_Dat$New_Cases - future_Dat$Policy_cases))
+  #rms_err <- rmse(future_Dat$New_Cases, future_Dat$Policy_cases)
+  rel_rmse <- sqrt(mean((future_Dat$Policy_cases - future_Dat$New_Cases)^2)) / sd(future_Dat$New_Cases)
+  if (accuracy == TRUE){
+    return(rel_rmse)
+  }
+  
+  # upperError <- totalRes %>% dplyr::pull(Policy_cases) + avg_err*qexp((1:31)/40)
+  # lowerError <- totalRes %>% dplyr::pull(Policy_cases) - avg_err*qexp((1:31)/40)
+  # totalRes <- cbind(totalRes, upperError, lowerError)
+  
+  fig <- plot_ly(totalRes, x = ~time, y = ~New_Cases, name = 'New Cases', type = 'scatter', mode = 'lines')
+  fig <- fig %>% add_trace(y = ~Policy_cases, name = 'Current Case Projection', mode = 'markers', marker = list(color = 'rgb(255, 0, 0)', size = 3))
+  fig <- fig %>% add_trace(y = ~Projected_Cases, name = 'Policy Cases Projection', mode = 'markers', marker = list(color = 'rgb(0, 128, 0)', size = 3))
+
+  fig <- fig %>% layout(title = paste(country, "new case projections", selected_date, sep = " "),  xaxis = list(title = "Date"), yaxis = list(title = 'New Cases'))
+
+  
+  # if (trueProj == TRUE){
+  #   fig <- fig %>% add_ribbons(x=totalRes$time, ymin=totalRes$lowerError, ymax=totalRes$upperError, name="Average Error", fillcolor = 'rgba(255, 0, 0, 0.1)', line=list(color="#366092", opacity=0.9, width=0))
+  # }
+  
+  fig %>% layout(hovermode = 'compare', yaxis = list(hoverformat = '.0f'))
+  
+}
+```
+
+
+### Predicting Reproduction Rate
+We postulated that the lag between policy implementation and impact on $R_0$ was 5 days. Thus, we predicted the reproduction rate 5 days into the future (`5D-RR`) based on present policies using linear regression, random forests and XGBOOST. 
+
+## Time-Varying Regression (TVLR)
+
+We primarily wanted to investigate what mobility factors influenced the `new_cases` at different time points. By understanding this, epidemiologists may be able to devise strategies to control these variables to control the spread of the virus. Thus, we used TVLR as a supplementary tool for policy makers to analyse. The model was fitted for 10 countries according to: 
+
+$$\text{new cases} = \beta_0(z_t) + \beta_{1}(z_t)x_{\text{walking}} + \beta_{2}(z_t)x_{\text{driving}}  + \beta_{3}(z_t)x_{\text{flights in}} +\\ \beta_{4}(z_t)x_{\text{facial coverings}} , t = 1,…..,T$$,
+
+where each of the $\beta(z_t)_i$ coefficients are functions of time. 
+
+# Model Evaluation/Appropriateness 
+
+## Clustering
+
+Some form of aggregation was necessary for meaningful comparison between countries. Aggregating monthly was natural and captured gave a sufficient level of detail when comparing the general trajectory between countries. 
+
+Using the `NbClust` package and the Scott and Friedman indexes, we identified the optimal number of clusters was 8. Furthermore, upon manual inspection 8 clusters provided an appropriate level of granularity for our purposes. 
+```{r}
+# Scott and Friedman method
+optimal_clusters = NbClust::NbClust(scaled_data,distance="euclidean",
+         min.nc=2,max.nc=24,method="ward.D2",index="scott",
+         alphaBeale=0.1)$Best.nc
+
+optimal_clusters = NbClust::NbClust(scaled_data,distance="euclidean",
+         min.nc=2,max.nc=24,method="ward.D2",index="friedman",
+         alphaBeale=0.1)$Best.nc
+
+plotly_dendrogram =heatmaply(t(scaled_data),
+                             hclust_method = "ward.D2",
+                             fontsize_col = 8,
+                             fontsize_row = 8,
+                             show_dendrogram = c(FALSE, FALSE),
+                             main = paste(
+                                 "<b> Dendrogram of countries with", 8, "clusters </b>"
+                                ),
+                             margins = c(0,50,NA,0),
+                             label_format_fun = function(x) round(x,digits=3),
+                             )  %>% layout(font= list(size = 10))
+```
+
+As hierarchical clustering is an unsupervised learning technique, it is difficult to evaluate the quality of the clusters. Thus, to overcome this we provided epidemiologists an optional interface (dendrogram and time series visualisations) within the shiny app to verify the quality of the clusters to determine whether the policies used by other countries are appropriate for their nation.
+
+### XGBOOST `5D-RR`
+
+We conducted hyperparameter optimisation for each algorithm and evaluated their out-of-sample performance using 5-fold cross-validation. The XGBOOST model performed the best with the lowest $MAE$ of 0.03 and highest $R^2$ value of 0.98. A detailed explanation of this procedure can be found in Appendix ABC. 
+
+### Feature Importance & Interpretation of XGBOOST Model
+
+The XGBOOST model provides superior performance, but relative to Linear Regression it is difficult to identify significance and direction/magnitude a variable has.  To overcome this issue, we conducted SHAP Plot analysis to provide an overview of the most important features of the model and elucidates whether a variable increased or decreased the estimated `5D-RR`.
+
+Variables are listed in descending order of importance. The most important policy for the model’s predictions are `Facial Coverings` followed by `International_Travel_Control`. The least important are the geographic scope of `Public_Info_Campaigns` and cancellation of `Public_Events`. 
+
+To determine whether a policy decreases or increases model predictions on average we observe the SHAP values on the x-axis. A negative SHAP value suggests that the variable reduced the magnitude of the estimate for `5D-RR`. Thus, if a policy is effective (increasing strictness level decreases the`5D-RR`.), we should see predominantly purple points associated with negative SHAP values. 
+
+
+```{r}
+library(xgboost)
+
+a = latest_data %>% 
+  filter(location %in% countries) %>% 
+  select(location, date, new_cases_per_million, reproduction_rate,new_deaths_smoothed) %>% 
+  inner_join(gov_response_renamed[,c(1,6:39)]) %>% 
+  select(-new_cases_per_million) %>% 
+  mutate(reproduction_rate1 = lead(reproduction_rate, 5)) %>% 
+  janitor::clean_names() 
+
+health_policies_new = c("Emergency_Investment_Healthcare",                 
+                        "Investment_Vaccine",
+                        "Cost_Binary_Flag")
+#Economic policies
+economic_policies_new = c("Income_Support","Income_Support_Sectoral_Scope","Debt_Contract_Relief","Fiscal_Measures",
+                          "International_Support") 
+
+
+a = a %>% select(!contains(health_policies_new)) %>% select(!contains(economic_policies_new )) %>% filter(date >= "2020-03-01") 
+a = a[,colSums(is.na(a)) < 0.05*nrow(a)] %>% na.omit()
+
+ax = a[,-19] %>% filter(date > "2020-03-01") %>% dplyr::select(-reproduction_rate,-date, -location) %>% as.matrix()
+ay = a %>% filter(date > "2020-03-01") %>% select(reproduction_rate1) %>% as.matrix()
+
+RR_model <-
+  xgboost(
+    data = ax,
+    label = ay,
+    nrounds = 1000,
+    objective = "reg:squarederror",
+    early_stopping_rounds = 3,
+    max_depth = 6,
+    eta = .25,
+    verbose = 0
+  )
+
+
+library("SHAPforxgboost")
+shap_long <- shap.prep(xgb_model = RR_model, X_train = ax )
+shap.plot.summary(shap_long)
+```
+
+
+## Simulation
+The SIR model was evaluated on the start of every month for each country. Real and projected cases based on the actual RR were compared using a normalised $RMSE$ score (Figure 3A.). The model did well for most countries but varied depending on the month.
+
+Since there could be errors in the predicted `5D-RR` we feed into the SIR model, we introduced a noise of $\pm 0.02$ (our average MAE) into our predictions to see the stability of our results. Increasing the predicted reproduction rate by 0.02 decreased the average normalised RMSE by $0.053$. Decreasing it by 0.02 increased the average normalised RMSE by $0.047$ Results changed minimally, indicating that the model is robust, but may have a downward bias.
+
+
+```{r}
+#Testing the accuracy (RMSE) of the SIR model.
+test_dates <- c("2020-04-01", "2020-05-01", "2020-06-01", "2020-07-01", "2020-08-01", "2020-09-01", "2020-10-01", "2020-11-01", "2020-12-01")
+test_countries <- c("Germany", "Australia", "United Kingdom", "Italy", "New Zealand","United States", "Spain", "India", "Japan", "Norway")
+
+acc_data_frame = data.frame(Country = character(),
+                            Month = character(),
+                            RMSE = double(),
+                            RMSE_upper = double(),
+                            RMSE_lower = double())
+
+for(country in test_countries){
+  for (day in test_dates){
+    new_data <- data.frame(country, month.abb[as.double(format(as.Date(day), "%m"))], simulation(covid, day, 0.7, country, trueProj = TRUE, accuracy = TRUE, recovery=0.074))
+    names(new_data) <- c("Country", "Month", "RMSE")
+    acc_data_frame <- rbind(acc_data_frame, new_data)
+  }
+}
+
+accurate_table <- matrix(acc_data_frame$RMSE,ncol=length(unique(acc_data_frame$Month)),byrow=TRUE)
+colnames(accurate_table) <- month.abb[4:12]
+rownames(accurate_table) <- test_countries
+accurate_table <- as.data.frame(accurate_table[ order(row.names(accurate_table)), ])
+
+noise_dat = data.frame(RMSE_upper = double(),
+                            RMSE_lower = double())
+
+for(country in test_countries){
+  for (day in test_dates){
+    new_data <- data.frame(simulation(covid, day, 0.7, country, trueProj = TRUE, accuracy = TRUE, recovery=0.074, upper = TRUE), simulation(covid, day, 0.7, country, trueProj = TRUE, accuracy = TRUE, recovery=0.074, lower = TRUE))
+    names(new_data) <- c("RMSE_Upper", "RMSE_lower")
+    noise_dat <- rbind(noise_dat, new_data)
+  }
+}
+
+noise_full_dat <- cbind(acc_data_frame, noise_dat)
+RMSE_diff_upper <- noise_full_dat$RMSE - noise_full_dat$RMSE_Upper
+RMSE_diff_lower <- noise_full_dat$RMSE - noise_full_dat$RMSE_lower
+upper_mean <- as.data.frame(mean(RMSE_diff_upper))
+lower_mean <- as.data.frame(mean(RMSE_diff_lower))
+RMSE_mean_df <- cbind(upper_mean, lower_mean)
+colnames(RMSE_mean_df) <- c("Mean RMSE (Upper)", "Mean RMSE (Lower)")
+# formattable(RMSE_mean_df %>% round(digits = 2))
+```
+
+See Appendix XYZ for details.
+
+## TVLR
+
+A Durbin-Watson and Breusch-Godfrey hypothesis test was used to assess the appropriateness of an autocorrelation (TVLR) model. These tests were conducted for each country and at a 5% level we rejected the null hypothesis that the residuals in the model are not autocorrelated for all of them. Thus, our TVLR model is appropriate. 
+
+```{r}
+# Data
+latest_data = read_csv("data/latest_data.csv")
+covid = latest_data %>% mutate(date = lubridate::as_date(date))
+mobility = read_csv("data/applemobilitytrends-2021-04-17.csv")
+
+# Changed clean mobility to only include countries
+cleaned_mobility = mobility[mobility$geo_type == "country/region",] %>% dplyr::select(-geo_type, -alternative_name, -`sub-region`, -country)  %>% gather(-transportation_type, -region,key = "date", value = "value") %>% group_by(region, date, transportation_type) %>% dplyr::slice(1) %>%  ungroup() %>%  pivot_wider(names_from = transportation_type, values_from = value ) %>% mutate(date = lubridate::as_date(date))
+
+# Read in and clean date column of government response data
+gov_response = read_csv("data/gov_response.csv")
+gov_response$Date = as.character(gov_response$Date)
+gov_response = gov_response %>% mutate(Date = lubridate::as_date(Date, format="%Y%m%d"))
+
+#Joined data
+data_joined = merge(covid, cleaned_mobility, by.x = c("location", "date"), by.y = c("region", "date"))
+
+
+# Monthly flight data
+flight_data = read_csv("data/flight_data.csv") %>% mutate(day = lubridate::as_date(day)) %>% mutate(year = year(day), month = lubridate::month(day))  %>% group_by(location = country_name, month, year) %>% group_modify(~ .x %>% mutate(flights_out = mean(flights_out), flights_in = mean(flights_in)) %>% dplyr::slice(1) ) %>% ungroup()
+
+flight_data = flight_data %>% mutate(label = paste(country_name, year, month )) %>% select(label, flights_in, flights_out)
+
+# Choice of countries for clustering
+# Removed Brazil, Singapore
+countries <- c("Germany", "Australia", "United Kingdom", "Italy", "New Zealand","United States", "Spain", "India", "Japan", "Norway")
+
+# Choice of variables for clustering
+subset_columns = c("location", "date","new_cases_smoothed_per_million","reproduction_rate", "new_vaccinations_smoothed", "driving", "walking", "median_age", "gdp_per_capita", "population_density", "human_development_index")
+
+# Filtering and joining data for scaling
+df = data_joined %>% select(subset_columns) 
+df_summ = df %>% group_by(location, m = lubridate::month(date), y = lubridate::year(date)) %>% summarise_all(mean, na.rm = TRUE)  %>% mutate(label = paste(location, y, m))  %>% ungroup() %>% inner_join(flight_data)
+df_summ_filtered = df_summ %>% filter(m >= 3|y == 2021, location %in% countries) %>%  ungroup()  %>% arrange(y,m, location) %>% select(-date,-y, -m, -location)  %>% replace(is.na(.), 0) 
+scaled_data = df_summ_filtered %>% mutate_if(is.numeric,scale) %>%  column_to_rownames("label")
+
+fd2j = read_csv("data/flight_data.csv") %>% mutate(date = lubridate::as_date(day)) %>% select(date = day, location = country_name, flights_out, flights_in)
+full_data =data_joined %>% inner_join(fd2j) %>% select(colnames(scaled_data), location,date) %>% mutate(new_vaccinations_smoothed = ifelse(is.na(new_vaccinations_smoothed), 0, new_vaccinations_smoothed))
+
+# Select useful column in gov_response
+gov_response = gov_response[, c("C1_School closing", "C2_Workplace closing", "C3_Cancel public events", "C4_Restrictions on gatherings", "C5_Close public transport","C6_Stay at home requirements", "C8_International travel controls", "E1_Income support", "E4_International support", "E2_Debt/contract relief", "H7_Vaccination policy", "H6_Facial Coverings", "H8_Protection of elderly people", "CountryName", "Date", "H1_Public information campaigns", "H2_Testing policy", "H3_Contact tracing", "H4_Emergency investment in healthcare", "C7_Restrictions on internal movement", "E3_Fiscal measures")]
+
+gov_response = gov_response %>% group_by(CountryName, Date) %>% dplyr::slice(1)
+gov_response = rename(gov_response, date = Date, location = CountryName)
+full_data = inner_join(full_data, gov_response, by = c("location", "date"))
+
+countries <- c("Germany", "Australia", "United Kingdom", "Italy", "New Zealand","United States", "Spain", "India", "Japan", "Norway")
+c = which(full_data$location %in% countries)
+full_data = full_data[c, ]
+
+full_data = na.omit(full_data)
+```
+
+
+```{r}
+# Autocorrelation test
+library(lmtest)
+countries = unique(full_data$location)
+rolling_df = full_data %>% select(-reproduction_rate) %>% filter((month(date) >=3) & (year(date) == 2020)) %>% janitor::clean_names() %>% select(-e1_income_support, -h8_protection_of_elderly_people , - h3_contact_tracing) %>% inner_join(latest_data %>% select(location, date, new_cases)) %>% select(-new_cases_smoothed_per_million) %>% group_by(location) %>% group_modify(~ .x %>% mutate(new_cases = new_cases)) %>% ungroup() 
+rolling_df  = rolling_df[,-c(2,5:8,10)]  
+dw_pvals = c()
+bg_pvals = c()
+for (i in (1:length(countries))){
+    standard_lm = lm(new_cases ~ driving + walking+ flights_in  - date, rolling_df %>% filter(location == countries[i]) )
+    dw_pvals[i] = dwtest(standard_lm)$p.value
+    bg_pvals[i] = bgtest(standard_lm)$p.value
+    
+}
+sum(dw_pvals < 0.05) == length(dw_pvals)
+sum(bg_pvals < 0.05) == length(bg_pvals)
+```
+
+##### Rolling CV 
+
+The purpose of this model was to observe time-varying coefficients in sample to understand the factors influenced Covid-19 cases over time. However, out of sample performance of this model was also evaluated using a rolling CV mechanism.
+
+With a CV loop, data was fit from the beginning of March-April (2020) and evaluated on the first 3 days of the following month (May). The model was then fit again from March-May and the $R^2$ and $MAE$ was calculated for the following month again. This process continued till we built a model until November 2020. A sketch of this process can be seen in Appendix XYZ. 
+
+Since the scale of new cases differs for each country, we compared performance of the models using $R^2$ which is invariant to scale. The model performs well for Germany and India, explaining on average 80% and 70% ($R^2$ score) of the variation respectively (Figure 3B.). While for New Zealand and the UK, only 44% and 50% of the variation is captured on average by the model. Thus, the effectiveness of the model is dependent on the country.  Overall, over a 3-day period, the model is reasonably robust.
+
+```{r}
+#Testing the accuracy (RMSE) of the SIR model.
+test_dates <- c("2020-04-01", "2020-05-01", "2020-06-01", "2020-07-01", "2020-08-01", "2020-09-01", "2020-10-01", "2020-11-01", "2020-12-01")
+test_countries <- c("Germany", "Australia", "United Kingdom", "Italy", "New Zealand","United States", "Spain", "India", "Japan", "Norway")
+
+acc_data_frame = data.frame(Country = character(),
+                            Month = character(),
+                            RMSE = double(),
+                            RMSE_upper = double(),
+                            RMSE_lower = double())
+
+for(country in test_countries){
+  for (day in test_dates){
+    new_data <- data.frame(country, month.abb[as.double(format(as.Date(day), "%m"))], simulation(covid, day, 0.7, country, trueProj = TRUE, accuracy = TRUE, recovery=0.074))
+    names(new_data) <- c("Country", "Month", "RMSE")
+    acc_data_frame <- rbind(acc_data_frame, new_data)
+  }
+}
+
+accurate_table <- matrix(acc_data_frame$RMSE,ncol=length(unique(acc_data_frame$Month)),byrow=TRUE)
+colnames(accurate_table) <- month.abb[4:12]
+rownames(accurate_table) <- test_countries
+accurate_table <- as.data.frame(accurate_table[ order(row.names(accurate_table)), ])
+
+color.picker1 <- function(z){
+  if(is.na(z)){return("white")}
+  else if(z <= 1){return("#ADFF4B")}
+  else if( z > 1 & z <= 1.5){return("#E4FCC7")}
+  else if( z > 1.5 & z <= 2.5){return("transparent")}
+  else {return("#FFB2B2")}
+}
+
+
+formattable(accurate_table  %>% round(digits= 2), lapply(1:nrow(accurate_table), function(row) {
+
+  area(row, col = 1:9) ~ formatter("span",
+       style = x ~ style(display = "block",
+       "border-radius" = "4px",
+       "padding-right" = "4px",
+       "background-color" = sapply(x,color.picker1)))
+}))
+
+
+```
+
+```{r}
+ahead_t= 3
+countries = unique(full_data$location)
+
+
+rolling_df = full_data %>% select(-reproduction_rate) %>% filter((month(date) >=3) & (year(date) == 2020)) %>% janitor::clean_names() %>% select(-e1_income_support, -h8_protection_of_elderly_people , - h3_contact_tracing) %>% inner_join(latest_data %>% select(location, date, new_cases)) %>% select(-new_cases_smoothed_per_million) %>% group_by(location) %>% group_modify(~ .x %>% mutate(new_cases = new_cases)) %>% ungroup() 
+
+rolling_df  = rolling_df[,-c(2,5:8,10)]
+rolling_df = rolling_df[,c(1:5,22, 16)]
+
+
+
+mat_mae = matrix(nrow = 9, ncol = length(countries))
+matR2 = matrix(nrow = 9, ncol = length(countries))
+
+for (i in 3:11){
+  
+  dc = rolling_df %>% filter(month(date) <= i) %>% arrange(date, dsc = FALSE)
+  
+  for (j in (1:length(countries))){
+    dcc = dc %>% filter(location == countries[j])
+    dcc = dcc  %>% select_if(function(x) length(unique(x)) != 1)
+    M1 = tvLM(new_cases ~ .- date, data =  dcc, bw= 1, est ="ll")
+    
+    vars2keep = M1$coefficients[,colSums(is.na(data.frame(M1$coefficients) )) == 0] %>% colnames()
+    dcc = dc %>% filter(location == countries[j])
+    dcc2 = dcc %>% select(contains(vars2keep), new_cases)
+    M2 = tvLM(new_cases ~ ., data =  dcc2, bw= 1, est ="ll")
+    
+    
+    testd = rolling_df %>% filter(location == countries[j], month(date) == (i+1)) %>% head(ahead_t)
+    
+    preds = forecast(M2, as.matrix(testd %>% select(contains(colnames(M2$coefficients)))) , n.ahead = nrow(testd)) 
+    preds = ifelse(preds< 0, 0, preds)
+    
+    mat_mae[i-2,j] = mean(abs(preds-testd$new_cases))
+    matR2[i-2,j] = R2(preds, testd$new_cases)
+  }
+}
+
+
+colnames(matR2) = countries
+colnames(mat_mae) = countries
+
+rownames(matR2) = c("Apr", "May", "June", "July", "Aug", "Sep", "Oct", "Nov", "Dec")
+rownames(mat_mae) = c("Apr", "May", "June", "July", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+CV_results = matR2 %>% apply(MARGIN = 2,FUN = mean,na.rm = TRUE)  %>% cbind(mat_mae %>% apply(MARGIN = 2,FUN = mean,na.rm = TRUE) ) %>% as.data.frame()
+colnames(CV_results) = c("R2", "MAE")
+
+
+
+colnames(matR2) = countries
+colnames(mat_mae) = countries
+rownames(matR2) = c("Apr", "May", "June", "July", "Aug", "Sep", "Oct", "Nov", "Dec")
+rownames(mat_mae) = c("Apr", "May", "June", "July", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+CV_results = matR2 %>% apply(MARGIN = 2,FUN = mean,na.rm = TRUE)  %>% cbind(mat_mae %>% apply(MARGIN = 2,FUN = mean,na.rm = TRUE) ) %>% as.data.frame()
+colnames(CV_results) = c("R2", "MAE") 
+
+# CV_results %>% rownames_to_column("Country") %>% datatable(options = list(pageLength = 10, dom = 'tip'), rownames = FALSE) 
+
+color.picker2 <- function(z){
+  if(is.na(z)){return("white")}
+  else if(z >= 0.75){return("#ADFF4B")}
+  else if(z < 0.75 & z >= 0.6){return("#E4FCC7")}
+  else if (z < 0.6 & z >= 0.5){return("transparent")}
+  else {return("#FFB2B2")}
+}
+
+formattable(CV_results, lapply(1:nrow(CV_results), function(row) {
+  area(row, col = 1) ~ formatter("span",
+       style = x ~ style(display = "block",
+       "border-radius" = "4px",
+       "padding-right" = "4px",
+       "background-color" = sapply(x,color.picker2)))
+}))
+
+```
+
+
+## Overall Limitations of Evaluation 
+Due to computational barriers we only tested the out-of-sample performance at the start of each month for our SIR and TVLR models. This may introduce systematic bias into our evaluation mechanism.
+
+The limitations of our rolling CV are that only 3 days of out of sample values are forecasted and thus future predictions from this model  are only valid during this time frame. 
+
+
+# Discussion
+From Figure:XYZ, we see that a more strict `Facial_Coverings` policy consistently decreases the predicted reproduction rate within the data. This suggests that mask mandates may be crucial in curbing the spread of the virus. The impact of `Internation_Travel_Control`, `Contract Tracing`, `School Closing` and `Elderly Protection` are generally less consistent in terms of the direction of their effect. However, they primarily contribute to a decrease in the predicted `5D-RR`. Interestingly, we see that higher levels of `Work_Closing` are associated with a higher predicted `5D-RR`. This suggests that this policy is either ineffective in controlling the virus or that its effect has a larger lag than 5 days. However, for the purposes of our SIR model, we want to capture the immediate effect of a policy intervention and thus the latter case was ignored. 
+
+
+::: {.superbigimage}
+```{r, fig.cap="Projection of new cases for Australia on June 1st"}
+#JAPAN example works for facial coverings & International flights
+#How to 
+
+fig1 <- simulation(covid, "2020-07-01", 1.2, "Japan", trueProj = TRUE, recovery = 0.074)
+fig2 <- simulation(covid, "2020-07-01", 1.2, "Japan", trueProj = TRUE, recovery = 0.074)
+fig <- subplot(fig1, fig2)
+fig
+```
+:::
+
+# Key Findings 
+
+Finally, we were able to see these policy implementations had a major correlaton with the ways countries had divergent pandemic responses. This was highlighted in our time series analysis which reinforced the interconnecteness of mobility on new cases during our Covid-19 timeline.
+
+By seeing these connections form around mobility, health regulations and international restrictions on new cases, we were able to understand the key factors for transmission to be rooted at these issues.
+http://127.0.0.1:40555/rmd_output/1/#key-findings
+#### Future Directions
+Our analysis predominantly focused on empowering epidemiologists to confidently recommend policies that can reduce the scale of an outbreak. However, although minimising cases is of paramount importance, this can be costly to the economy. Travel and business closures can halt domestic activity and drive a country into a recession. Future directions can involve collaborating with economists and financial advisors to simulate the cost to benefit ratio of implementing a policy during different stages of the pandemic. By justifying the usage of a policy from not only a health perspective but also a financial point of view, governments will be more likely to accept and implement policy recommendations. 
+
+Political factors can influence policy implementation as politicians face backlash from the general public.  Thus, future work can involve the creation of public health campaigns that inform individuals of the long-term benefits of policies backed by our simulation in maximising overall societal welfare. This will help educate the public on the rationale behind policy implementations, encouraging positive social attitudes to pandemic policy.
+
+
+
+# Shiny Application
+
+Our dashboard provides additional tools for epidemiologists and policy makers to understand the spread of the pandemic. It also allows them to develop insights into potential policies to handle future outbreaks.
+
+![Figure XYZ: Shiny App](images/shiny_app.png)
+
+## Deployment Process 
+
+To deploy the Shiny app, various sections of our code had to be integrated and the front-end. We provided help buttons on every dashboard tab to guide users on how they should use each tool.
+
+### Simulation (Figure XYZ Panel 1)
+
+1. Users are given the choice of 10 countries and a policy implementation date. 
+- Based on this date, policy recommendations (for step 2) are given in a table based on backend calculations as outlined in our clustering methodology. 
+2. Users can then choose a policy to implement a policy and a level of strictness for it.
+- Only curated policies determined from our SHAP analysis were options to limit to keep the results intuitive and save time for the user
+-  In the background our XGBOOST model predicts the reproduction rate based on their choice of policy and date and fed in as $R_0$ in the SIR model.  From this, users can see the simulated impact of different policies on new cases.
+3. Individuals can optionally verify the appropriateness of clusters (and policy recommendations) through a heatmap and time-series visualisation tab -  Appendix XYZ)
+
+### Forecasting (Panel 2 & 3 of Figure XYZ)
+
+1.  Users can select multiple countries to:
+a)  Visualise the time varying coefficients for a particular mobility variable and compare their magnitude and direction in different periods (Figure XYZ  Panel 2)
+b)  Predict the new cases between 1-10 days (Figure XYZ Panel 3)
+
+## Cross-Disciplinary Relevance
+
+Our Shiny-app synergises the statistical and analytical aspects of data science to develop tools for epidemiological and policymakers within a Covid-19 context. The app provides a user-friendly UI for these individuals to rapidly discern what policies are effective for their needs whilst abstracting the visibility of complex computations from the user. Additionally, to improve the usability of the dashboard, only necessary configuration options were provided to prevent overwhelming the user. 
+
+Furthermore, the simulation and forecasting capabilities of the app follow an intuitive workflow. E.g. In the simulation tab, users are first shown potential policy recommendations upon selecting a country and can immediately attempt to implement this candidate policy below. The main workflow of this panel is kept on a single tab to provide instant visual feedback based on user inputs.
+
+
+# Conclusion 
+
+From our analysis, we found that facial covering policies and international travel restrictions were critical factors in curbing the spread of the virus. Our time series analysis demonstrated how mobility factors influence new cases at different points of time. Furthermore, our models were fairly robust and applicable to a wide variety of countries.  Thus, by utilising our dashboard, Epidemiologists may be able to understand what policies could've employed to handle their country's pandemics and what factors to target at different time points. By gaining a deep apprehension of the effect of various policies, Epidemiologists will be able to collaborate with policy makers to make effective data driven decisions to develop intervention strategies to potentially curb future outbreaks.
+
+# Student Contributions
+
+Andrew McHale found several of our datasets,contributed to data preparation and tuning the random forest machine. He played a significant role creating tutorial pages for the tools and maintained clean CSS code in the Shiny app. Katharine Xu maintained weekly meeting minutes and helped to organise tasks. She had a key role in organising the presentation, created the welcome page and wrote informational sections for the project. Lennon Abonyi analysed the SIR model and helped create interactive visuals for our simulation panel. He also helped integrate his SIR visuals into our Shiny application. Sourish Lyengar contributed heavily to ensuring the validity of the models and theory underpinning the project. He wrote a significant portion of code for clustering and time series regression. He also provided immense direction for the Shiny app, incorporating clustering, time-series and simulation elements into informative and strong graphics. Yang Wang offered key direction and insight into the multi-linear regression component, highlighting XGBoost and regression models. He wrote code for the XGBoost model and helped deploy the Shiny app by contributing to the forecasting page with a time series graphic. All teammates helped gather, research and clean datasets and contributed significantly to the report.
+
+# References
+```{r}
+# please note
+# bib format <lastname><first name>, <title>, Publisher, year of publication, date accessed
+
+# https://www.bsg.ox.ac.uk/research/research-projects/covid-19-government-response-tracker
+# OxCGRT Covid Policy Tracker Data: https://github.com/OxCGRT/covid-po.licy-tracker/blob/master/data/OxCGRT_latest.csv
+# Our World In Data COVID data: https://github.com/owid/covid-19-data/blob/master/public/data/latest/owid-covid-latest.csv
+
+```
+
+ - Apple Inc. (2020). COVID-19-Mobility Trends Reports. Apple Inc. <https://covid19.apple.com/mobility>
+ 
+ - C.Appel, D.Beltekian, D.Gavrilov, C.Giattino, J.Hasell, B.Macdonald, E.Mathieu, E.O-Ospina, H.Ritchie, L.R-Guirao, M.Roser. Data on COVID-19 (coronavirus) by Our World in Data. Our World in Data, 2020. <https://github.com/owid/covid-19-data/blob/master/public/data/latest/owid-covid-latest.csv>
+ 
+ - H. Wickham. ggplot2: Elegant Graphics for Data Analysis. Springer-Verlag New York, 2016. viewed 21 April 2021. <https://www.nature.com/articles/s41562-021-01079-8>
+ 
+ - J.V Laan. (2019). Utah Lake Water Quality Profile Dashboard. Utah Division of Water Quality. <https://shiny.rstudio.com/gallery/lake-profile-dashboard.html>
+ 
+ - Sydney Data Stories. (2019). DATA2902 resources. GitHub. <https://pages.github.sydney.edu.au/DATA2002/2020/data2902.html>
+ 
+ - Thomas Hale, Noam Angrist, Rafael Goldszmidt, Beatriz Kira , Anna Petherick, Toby Phillips, Samuel Webster, Emily Cameron-Blake, Laura Hallas, Saptarshi Majumdar, and Helen Tatlow. (2021). A global panel database of pandemic policies (Oxford COVID-19 Government Response Tracker).” viewed 21 April 2021. <https://www.nature.com/articles/s41562-021-01079-8>
+
+
+ 
+ 
+# Appendix
+ 
+## Detailed Data Descriptions 
+ 
+### Our World In Data (OWID) COVID Data Description
+
+1. *location*: geographical location
+2. *date*: date of observation
+3. *total_cases*: total confirmed cases of COVID-19
+4. *new_cases*: new confirmed cases of COVID-19
+5. *total_deaths*: total deaths attributed to COVID-19
+6. *new_deaths*: new deaths attributed to COVID-19
+7. *reproduction_rate*: Real-time estimate of the effective reproduction rate (R) of COVID-19. See https://github.com
+8. *icu_patients*: Number of COVID-19 patients in intensive care units (ICUs) on a given day
+9. *hosp_patients*: Number of COVID-19 patients in hospital on a given day
+10. *weekly_icu_admissions*: Number of COVID-19 patients newly admitted to intensive care units (ICUs) in a given week 
+11. *total_tests*: Total tests for COVID-19
+12. *new_tests*: New tests for COVID-19 (only calculated for consecutive days)
+13. *positive_rate*: The share of COVID-19 tests that are positive, given as a rolling 7-day average (this is the inverse of tests_per_case)
+14. *tests_per_case*: Tests conducted per new confirmed case of COVID-19, given as a rolling 7-day average (this is the inverse of positive_rate)
+15. *total_vaccinations*: Total number of COVID-19 vaccination doses administered
+16. *people_vaccinated*: Total number of people who received at least one vaccine dose
+17. *people_fully_vaccinated*: Total number of people who received all doses prescribed by the vaccination protocol
+18. *new_vaccinations*: New COVID-19 vaccination doses administered (only calculated for consecutive days)
+19. *stringency_index*: Government Response Stringency Index: composite measure based on 9 response indicators including school closures, workplace closures, and travel bans, rescaled to a value from 0 to 100 (100 = strictest response)
+20. *population*: Population in 2020
+21. *population_density*: Number of people divided by land area, measured in square kilometers, most recent year available
+22. *life_expectancy*: Life expectancy at birth in 2019
+23. *Human_development_index*: A composite index measuring average achievement in three basic dimensions of human development: long and healthy life, knowledge and a decent standard of es for 2019, imported from http://hdr.undp.org/en/iliving
+ 
+ 
+### Oxford Covid 19 Government Response Covid Policy Tracker Data (OxCGRT) Data Description
+
+* Containment and closure policies
+  1. *C1_School closing*: Record closings of schools and universities
+  2. *C2_Workplace closing*: Record closings of workplaces
+  3. *C3_Cancel public events*: Record cancelling public events
+  4. *C4_Restrictions on gatherings*: Record limits on gatherings
+  5. *C5_Close public transport*: Record closing of public transport
+  6. *C6_Stay at home requirements*: Record orders to "shelter-in-place" and otherwise confine to the home
+  7. *C7_Restrictions on internal movement*: Record restrictions on internal movement between cities/regions
+  8. *C8_International travel controls*: Record restrictions on international travellers
+* Economic policies
+  1. *E1_Income support*: Record if the government is providing direct cash payments to people who lose their jobs or cannot work.
+  2. *E2_Debt/contract relief*: Record if the government is freezing financial obligations for households (eg stopping loan repayments, preventing services like water from stopping, or banning evictions)
+  3. *E3_Fiscal measures*: Announced economic stimulus spending (USD)
+  4. *E4_International support*: Announced offers of Covid-19 related aid spending to other countries (USD)
+* Health system policies
+  1. *H1_Public information campaigns*: Record presence of public info campaigns
+  2. *H2_Testing policy*: Record government policy on who has access to testing
+  3. *H3_Contact tracing*: Record government policy on contact tracing after a positive diagnosis
+  4. *H4_Emergency investment in healthcare*: Announced short term spending on healthcare system, eg hospitals, masks, etc (USD)
+  5. *H5_Investment in vaccines*: Announced public spending on Covid-19 vaccine development
+  6. *H6_Facial Coverings*: Record policies on the use of facial coverings outside the home
+  7. *H7_Vaccination Policy*: Record policies for vaccine delivery for different groups
+  8. *H8_Protection of elderly people*: Record policies for protecting elderly people (as defined locally) in Long Term Care Facilities and/or the community and home setting
+* Miscellaneous policies
+  1. *M1_Wildcard*: Record policy announcements that do not fit anywhere else
+
+### Apple COVID 19 Mobility Trends Data Description
+
+1. *geo_type*: Country name
+2. *region*: County, country, city, sub-region
+3. *transportation_type*: walking, driving, public transport
+4. *alternative_name*: text field for different variations of country name
+5. *sub-region*: name of sub-region
+6. *country*: name of country
+
+
+### Flight Mobility dataset description
+
+1. *origin_country*: The ISO 3166-1 alpha-2 code for the country in this row
+2. *day*: The date
+3. *flights_out*: The number of flights that left the country on this date
+4. *flights_in*: The number of flights that entered the country on this date
+5. *country_name*: The name of the country
+
+## Creation of Flight Data
+
+*Note: The following code is not run and is just included for explanation purposes*
+
+The flight list CSV files were obtained from Zenodo, with the data originally being from the OpenSky Network. To find the country that the flights were arriving at/departing from, another dataset had to be sourced from OurAirports. This file contained a mapping between each airport and its country's ISO 3166-1 alpha-2 code. In addition, a mapping between the country and country code had to be sourced so that the country could be obtained from the ISO 3166-1 alpha-2 code (which was the only country identifier provided in the airports data). An R package called *countrycode* was used to achieve this.
+
+The following steps were performed to create the flight_data.csv file used in our analysis:
+
+* The monthly csv files obtained from the website were read in one by one.  
+* For each file:
+    + The source and destination countries of each flight were determined using the airports data.
+    + The date column was converted to the Date data type.
+    + A new data frame was created with flights in and flights out columns. These columns were created by grouping based on country and date and counting the number of times each country appeared as a origin country or destination country.
+    + This data frame was then joined to an overall data frame, and the next month was considered.
+* Once all months had been processed and joined to the overall data frame, the country names were obtained from the codes.
+* After this, a number of manual changes were made to the country names so they were consistent with the names found in the other datasets.
+* Finally, the formatted data frame was outputted to a CSV file.
+
+```{r, eval=FALSE}
+
+# All flight data files obtained from https://zenodo.org/record/4670228#.YI9CrSYRX0o
+# Airports.csv (used to get country from airport code) sourced from https://ourairports.com/data/
+
+overall_df = data.frame()
+
+files = c("flight_data/flightlist_20200101_20200131.csv", "flight_data/flightlist_20200201_20200229.csv", "flight_data/flightlist_20200301_20200331.csv", "flight_data/flightlist_20200401_20200430.csv", "flight_data/flightlist_20200501_20200531.csv", "flight_data/flightlist_20200601_20200630.csv", "flight_data/flightlist_20200701_20200731.csv", "flight_data/flightlist_20200801_20200831.csv", "flight_data/flightlist_20200901_20200930.csv", "flight_data/flightlist_20201001_20201031.csv", "flight_data/flightlist_20201101_20201130.csv", "flight_data/flightlist_20201201_20201231.csv", "flight_data/flightlist_20210101_20210131.csv", "flight_data/flightlist_20210201_20210228.csv", "flight_data/flightlist_20210301_20210331.csv")
+
+months = c("Jan 2020", "Feb 2020", "Mar 2020", "Apr 2020", "May 2020", "Jun 2020", "Jul 2020", "Aug 2020", "Sep 2020", "Oct 2020", "Nov 2020", "Dec 2020", "Jan 2021", "Feb 2021", "Mar 2021")
+
+i = 1
+
+while (i < length(months)) {
+  data = read.csv(files[[i]])
+  
+  airports = read.csv("flight_data/airports.csv")
+  
+  airports_join = airports %>% select(ident, iso_country)
+  
+  # Get source country
+  data <- data %>% left_join(airports_join, by = c("origin" = "ident")) %>% rename(origin_country = iso_country)
+  
+  # Get destination country
+  data <- data %>% left_join(airports_join, by = c("destination" = "ident")) %>% rename(destination_country = iso_country)
+  
+  data <- data %>% mutate(day = as.Date(day))
+  
+  origin_df <- data %>% group_by(day, origin_country) %>% count() %>% rename(flights_out = n)
+  dest_df <- data %>% group_by(day, destination_country) %>% count() %>% rename(flights_in = n)
+  combined_df <- na.omit(origin_df %>% full_join(dest_df, by = c("origin_country" = "destination_country", "day" = "day")))
+  overall_df <- rbind(overall_df, combined_df)
+  i = i + 1
+}
+
+country_code = countrycode::codelist %>% select(country.name.en, iso2c)
+overall_df = overall_df %>% left_join(country_code, by = c("origin_country" = "iso2c")) %>% select(-origin_country) %>% rename(country_name = country.name.en)
+overall_df$country_name[overall_df$country_name == "Hong Kong SAR China"] = "Hong Kong"
+overall_df$country_name[overall_df$country_name == "Macao SAR China"] = "Macao"
+overall_df$country_name[overall_df$country_name == "St. Vincent & Grenadines"] = "Saint Vincent and the Grenadines"
+overall_df$country_name[overall_df$country_name == "St. Lucia"] = "Saint Lucia"
+overall_df$country_name[overall_df$country_name == "St. Pierre & Miquelon"] = "Saint Pierre and Miquelon"
+
+write.csv(overall_df, "flight_data.csv", row.names=FALSE)
+
+```
+
+## Datasets - Variables Used
+
+```{r}
+library(gt)
+
+data_sources = data.frame(data_source = c("[Our World in Data COVID-19](https://covid.ourworldindata.org/data/owid-covid-data.csv)", 
+                                          "[Oxford COVID-19 Government Response Tracker Data](https://raw.githubusercontent.com/OxCGRT/covid-policy-tracker/master/data/OxCGRT_latest.csv)",  
+                                          "[Apple COVID-19 Mobility Trends Data](https://covid19.apple.com/mobility)",
+                                          "[Flight Mobility Dataset](https://zenodo.org/record/4601480#.YMK305ozb0o)"),
+  variables_used = c("
+For Clustering: 
+- date
+- location
+- new_cases
+- new_vaccinations
+- reproduction_rate
+
+For the Simulation: 
+- date
+- location
+- reproduction_rate
+- population
+
+For Forecasting:
+- date
+- location
+- new_cases
+- new_vaccinations
+- reproduction_rate
+- population", "
+
+For Clustering/Policy Table:
+- CountryName
+- Date
+- C1_School closing
+- C2_Workplace closing
+- C3_Cancel public events
+- C4_Restrictions on gatherings
+- C5_Close public transport
+- C6_Stay at home requirements
+- C7_Restrictions on internal movement
+- C8_International travel controls
+- E1_Income support
+- E2_Debt/contract relief
+- E3_Fiscal measures
+- E4_International support
+- H1_Public information campaigns
+- H2_Testing policy
+- H3_Contact tracing
+- H4_Emergency investment in healthcare
+- H5_Investment in vaccines
+- H6_Facial Coverings
+- H7_Vaccination Policy
+- H8_Protection of elderly people
+
+For the Simulation:
+- CountryName
+- Date
+- C1_School closing
+- C2_Workplace closing
+- C3_Cancel public events
+- C4_Restrictions on gatherings
+- C5_Close public transport
+- C6_Stay at home requirements
+- C7_Restrictions on internal movement
+- C8_International travel controls
+- E1_Income support
+- E2_Debt/contract relief
+- E3_Fiscal measures
+- E4_International support
+- H1_Public information campaigns
+- H2_Testing policy
+- H3_Contact tracing
+- H4_Emergency investment in healthcare
+- H5_Investment in vaccines
+- H6_Facial Coverings
+- H7_Vaccination Policy
+- H8_Protection of elderly people
+", "
+For Clustering:
+- region
+- transportation_type
+- all columns after this (dates with mobility scores)
+
+For Forecasting:
+- region
+- transportation_type
+- all columns after this (dates with mobility scores)
+
+", "
+For Clustering:
+- day
+- flights_in
+- country_name
+
+For the Simulation:
+- day
+- flights_in
+- flights_out
+- country_name
+
+For Forecasting:
+- day
+- flights_in
+- country_name
+
+")) 
+
+data_sources %>% gt() %>% fmt_markdown(columns = everything()) %>% cols_label(data_source = "Data Source", variables_used = "Variables used")
+```
+
+
+# Clustering & Policy Table
+
+### Clustering Dendrogram 
+
+
+```{r, fig.align='center', fig.cap= "Clustering Dendrogram", fig.topcaption=TRUE}
+# Choice of countries for clustering
+countries <- c("Germany", "Australia", "United Kingdom", "Italy", "New Zealand","United States", "Spain", "India", "Japan", "Norway")
+
+# Choice of variables for clustering
+subset_columns = c("location", "date","new_cases_smoothed_per_million","reproduction_rate", "new_vaccinations_smoothed", "driving", "walking", "median_age", "gdp_per_capita", "population_density", "human_development_index")
+
+# Filtering and joining data for scaling
+df = data_joined %>% select(subset_columns) 
+df_summ = df %>% group_by(location, m = lubridate::month(date), y = lubridate::year(date)) %>% summarise_all(mean, na.rm = TRUE)  %>% mutate(label = paste(location, y, m))  %>% ungroup() %>% inner_join(flight_data)
+df_summ_filtered = df_summ %>% filter(m >= 3|y == 2021, location %in% countries) %>%  ungroup()  %>% arrange(y,m, location) %>% select(-date,-y, -m, -location)  %>% replace(is.na(.), 0) 
+
+min_max_scale = function(x){
+  (x - min(x))/(max(x) - min(x))
+}
+
+scaled_data = df_summ_filtered %>% mutate_if(is.numeric,min_max_scale ) %>%  column_to_rownames("label") %>% select(-human_development_index,-median_age, -gdp_per_capita, -population_density)
+
+fd2j = read_csv("data/flight_data.csv") %>% mutate(date = lubridate::as_date(day)) %>% select(date = day, location = country_name, flights_out, flights_in)
+full_data =data_joined %>% inner_join(fd2j) %>% select(colnames(scaled_data), location,date) %>% mutate(new_vaccinations_smoothed = ifelse(is.na(new_vaccinations_smoothed), 0, new_vaccinations_smoothed))
+
+# Cleaned Clustering Data
+colnames(scaled_data)[1] = "new_cases_per_million"
+scaled_data = scaled_data %>% select(-flights_out)
+colnames(scaled_data) = colnames(scaled_data) %>% str_replace_all("_", " ") %>% str_replace_all("smoothed", "")%>%  str_to_title()
+dist_scaled_data = dist(scaled_data)
+```
+
+
+```{r}
+# Scott and Friedman method
+optimal_clusters = NbClust::NbClust(scaled_data,distance="euclidean",
+         min.nc=2,max.nc=24,method="ward.D2",index="scott",
+         alphaBeale=0.1)$Best.nc
+
+optimal_clusters = NbClust::NbClust(scaled_data,distance="euclidean",
+         min.nc=2,max.nc=24,method="ward.D2",index="friedman",
+         alphaBeale=0.1)$Best.nc
+```
+
+::: {.superbigimage}
+```{r,fig.width= 20}
+plotly_dendrogram =heatmaply(t(scaled_data),
+                             hclust_method = "ward.D2",
+                             fontsize_col = 8,
+                             fontsize_row = 8,
+                             show_dendrogram = c(FALSE, FALSE),
+                             main = paste(
+                                 "<b> Dendrogram of countries with", 8, "clusters </b>"
+                                ),
+                             margins = c(0,50,NA,0),
+                             label_format_fun = function(x) round(x,digits=3),
+                             )  %>% layout(font= list(size = 10))
+
+
+plotly_dendrogram
+```
+::: 
+
+### Policy Table Example
+```{r}
+hclust_res <- hclust(dist_scaled_data, method="ward.D2")
+hclust_cluster <- cutree(hclust_res, k = 8) %>% as.factor() %>% as.data.frame()
+colnames(hclust_cluster) = "clust_res"
+
+target_label = paste("Australia", year("2020-07-01"), month("2020-07-01")) 
+future_label = paste("Australia", year("2020-08-01"), month("2020-08-01")) 
+
+target_new_cases = df_full %>% filter(label == future_label) %>% pull(new_cases_smoothed_per_million)
+
+Bcluster = hclust_cluster %>% rownames_to_column("label") %>% filter(label == target_label) %>% pull(clust_res)
+Fcluster = hclust_cluster %>% rownames_to_column("label") %>% filter(label == target_label) %>% pull(clust_res)
+
+
+df_before = as.data.frame(as.matrix(dist_scaled_data)) %>% select(before = contains(target_label)) %>% rownames_to_column("label") %>% inner_join(hclust_cluster %>% rownames_to_column("label")) %>% filter(clust_res == Bcluster) %>% inner_join(df_policy) 
+
+# Set the baseline for the before group the the time when countries were most similar
+df_before_splice = df_before %>% group_by(location) %>% filter(before == min(before))
+df_after = as.data.frame(as.matrix(dist_scaled_data)) %>% select(after = contains(future_label)) %>% rownames_to_column("label") %>% inner_join(hclust_cluster %>% rownames_to_column("label")) %>% filter(clust_res != Fcluster) %>% inner_join(df_policy)  
+
+df_table = df_before_splice %>% merge(df_after, by = "location", all = TRUE) %>% filter((month.y - month.x == 1  & year.x == year.y )|year.x > year.y & month.x == 12)  %>%  mutate(change = (after-before)/before)  
+
+initial_table = rbind(data.frame(location = "Australia", month = month("2020-07-01"), year = year("2020-07-01"), change = 0),df_table %>% select(location, month = month.x, year = year.x, change = change )) %>% drop_na()
+future_table = initial_table %>% mutate(year = ifelse(month == 12|year == 2021, 2021, 2020) ) %>%  mutate(month = ifelse(month == 12, 1, month +1)) %>% inner_join(df_full %>% select(location, month, year, new_cases_smoothed_per_million), by = c("location","month", "year")) %>% 
+  mutate(compare_cases = ifelse(new_cases_smoothed_per_million < target_new_cases,"Better", "Worse")) %>% mutate(compare_cases = ifelse(location == "Australia", "-", compare_cases)) %>%  group_by(compare_cases) %>%  filter(change == max(change))  %>% select(-new_cases_smoothed_per_million) %>% ungroup()
+
+initial_table = initial_table  %>% inner_join(future_table %>% select(location, compare_cases))# %>% filter(!is.na(compare_cases) | location == "Australia") 
+
+final_table = initial_table %>% rbind(future_table) %>% mutate(month = paste(month), year = paste(year)) %>% select(-change)
+P1_table = final_table %>% inner_join(df_policy %>% mutate(month = paste(month), year = paste(year)), by = c("location","year","month"))
+
+# FORMATTING TABLE
+policy_change_table = P1_table   %>% group_by(location) %>% group_modify(~mutate_if(.x, is.numeric, diff )   %>% dplyr::slice(1) ) %>% 
+    ungroup()  %>% mutate(month = as.numeric(month), year = as.numeric(year)) %>% 
+    replace(is.na(.),0) %>% mutate(yRange = paste(year, "-", ifelse(month == 12|year == 2021, "2021", "2020")) ) %>%  
+    mutate(tRange =  paste(month, "-", ifelse(month == 12, 1,month+1)))   %>% select(-label, -month, -year) %>% 
+    mutate(location = paste(location, yRange)) 
+
+policy_change_table = policy_change_table %>% mutate_if(is.numeric, round, digits = 2) %>% select(location, months =tRange, everything(), -yRange)
+policy_change_table = policy_change_table %>% mutate(compare_cases= factor(compare_cases, levels = c("-", "Better", "Worse") )) %>% 
+    arrange(compare_cases) %>%  rename_all(str_to_title) 
+
+
+future_policy_table = P1_table %>% mutate(month = as.numeric(month), year = as.numeric(year))  %>% group_by(location) %>%  
+    group_modify(~arrange(.x,year, month) %>% dplyr::slice(2)) 
+future_policy_table = future_policy_table %>% ungroup()  %>% mutate(month = as.numeric(month), year = as.numeric(year)) %>% 
+    replace(is.na(.),0) %>% mutate(yRange = paste(year, "-", ifelse(month == 12|year == 2021, "2021", "2020")) ) %>%  
+    mutate(tRange =  paste(month, "-", ifelse(month == 12, 1,month+1)))   %>% select(-label, -month, -year) %>%
+    mutate(location = paste(location, yRange)) 
+
+future_policy_table = future_policy_table  %>% mutate_if(is.numeric, round, digits = 2) %>% 
+    select(location, months =tRange, everything(), -yRange)
+
+future_policy_table = future_policy_table %>% mutate(compare_cases= factor(compare_cases, levels = c("-", "Better", "Worse") )) %>% 
+    arrange(compare_cases) %>%  rename_all(str_to_title) 
+    
+future_policy_table$Months = policy_change_table$Months
+
+# Add arrows to table
+for(col in 4:ncol(future_policy_table)){
+    future_policy_table[col] <- mapply(function(i,j){
+        paste("<b>",ifelse(i > 0, paste0("<span style='color:green'>",j,"<font>&uArr; </font></span>"),
+                           ifelse(i<0, paste0("<span style='color:red'>",j,"<font>&dArr; </font></span>"),
+                                  paste0(j))) ,"</b>")
+    },policy_change_table[col],future_policy_table[col])
+}
+
+future_policy_table = future_policy_table %>% 
+  select(contains(policy_change_table %>% colnames())) %>% select_if(function(x) ifelse(is.numeric(x), ifelse(sum(x) != 0, TRUE, FALSE), TRUE )) %>% 
+  mutate(Location = paste("<b>", Location, "</b>")) %>% rename("Average cases in the dissimilar period relative to the #selected location" = "Compare_cases")
+
+future_policy_table %>% rownames_to_column("Country") %>% datatable(options = list(pageLength = 10, dom = 't'), rownames = FALSE, escape = FALSE) 
+```
+
+
+## Predicting Reproduction Rate - Model Comparison
+
+As part of the simulation component of the project, the reproduction rate had to be accurately predicted based on government policy data. This value then feeds into the SIR model used to simulate the amount of new cases. The reproduction rate is the number of cases that are expected to occur on average if one person is infected with COVID. For example, a reproduction rate of 2 would mean that on average every person infected with COVID will spread it to 2 others. In order to predict this metric accurately, a number of different machine learning algorithms were considered. These include:
+
+* Multiple Linear Regression  
+* Random Forests  
+* XGBoost
+
+### Preparing the data
+
+To evaluate each of the machine learning algorithms, we use an 80-20 train test split.
+
+```{r}
+# Read in preprocessed data for model evalutation
+train_model_data <- read.csv("data/output_data.csv",
+                       stringsAsFactors = FALSE,
+                       check.names =  FALSE,
+                       row.names = 1)
+
+# Create train and test partitions
+indexes = createDataPartition(train_model_data$reproduction_rate, p = .80, list = F)
+data_x = as.matrix(train_model_data[, 7:27])
+data_y = as.matrix(train_model_data[, 3])
+train_x = data_x[indexes, ]
+test_x = data_x[-indexes, ]
+train_y = data_y[indexes, ]
+test_y = data_y[-indexes, ]
+train_combined = as.data.frame(cbind(train_x, train_y))
+```
+
+### Multiple Linear Regression
+
+The first algorithm considered to predict the reproduction rate was multiple linear regression. This was examined first as it is a relatively simple model and thus it could be used as a baseline before implementing more complex machine learning methods. Additionally, a linear model is intuitive to interpret in terms of the various government policies affecting the reproduction rate.
+
+```{r}
+# Fit the linear model using caret and compare with test data to get accuracy
+lm_fit <- caret::train(train_y ~ ., 
+                       data=train_combined,
+                       method="lm")
+y_pred = predict(lm_fit, test_x)
+lm_results = caret::postResample(y_pred, test_y)
+```
+
+This model did not perform well, with a $R^2$ value of `r lm_results[['Rsquared']]` and a Mean Absolute Error (MAE) of `r lm_results[['MAE']]`. Thus, it was determined that more complex models would have to be investigated to increase the accuracy of the prediction.
+
+### Random Forests
+
+Following the poor accuracy of the Multiple Linear Regression Model, the Random Forest algorithm was considered as a potential method for predicting the reproduction rate. The optimal hyperparameters for the data were determined using the caret package.
+
+```{r, message = FALSE, cache=TRUE}
+# Fit the random forest model using caret and compare with test data to get accuracy
+rf_grid_1 <- expand.grid(
+  mtry = 4
+)
+
+rf_fit <- caret::train(train_y ~. , data=train_combined,
+             method = "rf", trControl = trainControl(method = "cv", number = 5),
+             tuneGrid = rf_grid_1,
+             ntree = 50,
+             maxnodes = 18)
+y_pred = predict(rf_fit, test_x)
+rf_results = caret::postResample(y_pred, test_y)
+```
+
+The $R^2$ value was found to be `r rf_results[['Rsquared']]`, and the MAE was `r rf_results[['MAE']]`. This is a significant improvement over the Multiple Linear Regression model. However, this value is stil not high enough to indicate that the Random Forest algorithm is a suitable predictor for the reproduction rate. Thus, we considered other some other options.
+
+
+### XGBOOST
+
+Finally, an XGBOOST model was fitted on the data. This gradient boosting algorithm algorithm was considered because of its fast speed and high performance.
+
+The optimal values of the hyperparameters were determined using the caret package. 
+
+```{r, message = FALSE, warning = FALSE, error = FALSE, result='hide', cache=TRUE}
+# Fit the xgboost model using caret and compare with test data to get accuracy
+xgb_grid_1 <- expand.grid(
+  nrounds = 1000,
+  eta = 0.25,
+  max_depth = 6,
+  gamma = 0,
+  colsample_bytree=1,
+  min_child_weight=1,
+  subsample = 1
+)
+
+messages <- capture.output(xgb_fit <- caret::train(train_y ~. , data=train_combined,
+             method = "xgbTree", trControl = trainControl(method = "cv", number = 5),
+             tuneGrid = xgb_grid_1,
+             trace = FALSE))
+y_pred = predict(xgb_fit, test_x)
+xgb_results = caret::postResample(y_pred, test_y)
+```
+
+The $R^2$ value for this model was found to be `r xgb_results[['Rsquared']]`, meaning that a large amount of the variation in the reproduction rate is predicted by the other variables. This is a very high $R^2$ value. The MAE was `r xgb_results[['MAE']]`. This relatively low value indicates that there is not much error present in the model. Thus, XGBoost was selected as the algorithm to predict reproduction rate for the *Simulation*.
+
+# Forecasting - Rolling CV
+
+```{r, fig.align='center', fig.cap= "Time Series Rolling Cross-Validation Illustration", fig.topcaption=TRUE}
+type <- c('Train(Mar-May)','Test(1st-3rd May)',' ')
+nums <- c(2,0.4,7)
+df <- data.frame(type = type, nums = nums)
+# Compute percentages
+df$fraction <- df$nums / sum(df$nums)
+# Compute the cumulative percentages (top of each rectangle)
+df$ymax <- cumsum(df$fraction)
+# Compute the bottom of each rectangle
+df$ymin <- c(0, head(df$ymax, n=-1))
+# Compute label position
+df$labelPosition <- (df$ymax + df$ymin) / 2
+# Compute a good label
+df$label <- df$type
+p1 = ggplot(df, aes(ymax=ymax, ymin=ymin, xmax=4, xmin=3, fill=type)) +
+  geom_rect() +
+  coord_polar(theta="y") + # Try to remove that to understand how the chart is built initially
+  xlim(c(2, 4))+
+  scale_fill_manual(values=c("#ffffff", "#E69F00", "#999999")) +   theme_void() +
+  labs(title = "1st Rolling CV Loop") + theme(plot.title=element_text(hjust=0.5, vjust=0.1, face='bold'))+ guides(fill = guide_legend(reverse = TRUE, title=NULL))
+type <- c('Train(Mar-Jun)','Test(1st-3rd Jun)',' ')
+nums <- c(3,0.4,6)
+df <- data.frame(type = type, nums = nums)
+# Compute percentages
+df$fraction <- df$nums / sum(df$nums)
+# Compute the cumulative percentages (top of each rectangle)
+df$ymax <- cumsum(df$fraction)
+# Compute the bottom of each rectangle
+df$ymin <- c(0, head(df$ymax, n=-1))
+# Compute label position
+df$labelPosition <- (df$ymax + df$ymin) / 2
+# Compute a good label
+df$label <- df$type
+p2 = ggplot(df, aes(ymax=ymax, ymin=ymin, xmax=4, xmin=3, fill=type)) +
+  geom_rect() +
+  coord_polar(theta="y") + # Try to remove that to understand how the chart is built initially
+  xlim(c(2, 4))+
+  scale_fill_manual(values=c("#ffffff", "#E69F00", "#999999")) +   theme_void() +
+  labs(title = "2nd Rolling CV Loop") + theme(plot.title=element_text(hjust=0.5, vjust=0.1, face='bold'))+ guides(fill = guide_legend(reverse = TRUE, title=NULL))
+type <- c('Train(Mar-Jul)','Test(1st-3rd Jul)',' ')
+nums <- c(4,0.4,5)
+df <- data.frame(type = type, nums = nums)
+# Compute percentages
+df$fraction <- df$nums / sum(df$nums)
+# Compute the cumulative percentages (top of each rectangle)
+df$ymax <- cumsum(df$fraction)
+# Compute the bottom of each rectangle
+df$ymin <- c(0, head(df$ymax, n=-1))
+# Compute label position
+df$labelPosition <- (df$ymax + df$ymin) / 2
+# Compute a good label
+df$label <- df$type
+p3 = ggplot(df, aes(ymax=ymax, ymin=ymin, xmax=4, xmin=3, fill=type)) +
+  geom_rect() +
+  coord_polar(theta="y") + # Try to remove that to understand how the chart is built initially
+  xlim(c(2, 4))+
+  scale_fill_manual(values=c("#ffffff", "#E69F00", "#999999")) +   theme_void() +
+  labs(title = "3rd Rolling CV Loop") + theme(plot.title=element_text(hjust=0.5, vjust=0.1, face='bold'))+ guides(fill = guide_legend(reverse = TRUE, title=NULL))
+type <- c('Train(Mar-Aug)','Test(1st-3rd Aug)',' ')
+nums <- c(5,0.4,4)
+df <- data.frame(type = type, nums = nums)
+# Compute percentages
+df$fraction <- df$nums / sum(df$nums)
+# Compute the cumulative percentages (top of each rectangle)
+df$ymax <- cumsum(df$fraction)
+# Compute the bottom of each rectangle
+df$ymin <- c(0, head(df$ymax, n=-1))
+# Compute label position
+df$labelPosition <- (df$ymax + df$ymin) / 2
+# Compute a good label
+df$label <- df$type
+p4 = ggplot(df, aes(ymax=ymax, ymin=ymin, xmax=4, xmin=3, fill=type)) +
+  geom_rect() +
+  coord_polar(theta="y") + # Try to remove that to understand how the chart is built initially
+  xlim(c(2, 4))+
+  scale_fill_manual(values=c("#ffffff", "#E69F00", "#999999")) +   theme_void() +
+  labs(title = "4th Rolling CV Loop") + theme(plot.title=element_text(hjust=0.5, vjust=0.1, face='bold'))+ guides(fill = guide_legend(reverse = TRUE, title=NULL))
+type <- c('Train(Mar-Sept)','Test(1st-3rd Sept)',' ')
+nums <- c(6,0.4,3)
+df <- data.frame(type = type, nums = nums)
+# Compute percentages
+df$fraction <- df$nums / sum(df$nums)
+# Compute the cumulative percentages (top of each rectangle)
+df$ymax <- cumsum(df$fraction)
+# Compute the bottom of each rectangle
+df$ymin <- c(0, head(df$ymax, n=-1))
+# Compute label position
+df$labelPosition <- (df$ymax + df$ymin) / 2
+# Compute a good label
+df$label <- df$type
+p5 = ggplot(df, aes(ymax=ymax, ymin=ymin, xmax=4, xmin=3, fill=type)) +
+  geom_rect() +
+  coord_polar(theta="y") + # Try to remove that to understand how the chart is built initially
+  xlim(c(2, 4))+
+  scale_fill_manual(values=c("#ffffff", "#E69F00", "#999999")) +   theme_void() +
+  labs(title = "5th Rolling CV Loop") + theme(plot.title=element_text(hjust=0.5, vjust=0.1, face='bold'))+ guides(fill = guide_legend(reverse = TRUE, title=NULL))
+type <- c('Train(Mar-Oct)','Test(1st-3rd Oct)',' ')
+nums <- c(7,0.4,2)
+df <- data.frame(type = type, nums = nums)
+# Compute percentages
+df$fraction <- df$nums / sum(df$nums)
+# Compute the cumulative percentages (top of each rectangle)
+df$ymax <- cumsum(df$fraction)
+# Compute the bottom of each rectangle
+df$ymin <- c(0, head(df$ymax, n=-1))
+# Compute label position
+df$labelPosition <- (df$ymax + df$ymin) / 2
+# Compute a good label
+df$label <- df$type
+p6 = ggplot(df, aes(ymax=ymax, ymin=ymin, xmax=4, xmin=3, fill=type)) +
+  geom_rect() +
+  coord_polar(theta="y") + # Try to remove that to understand how the chart is built initially
+  xlim(c(2, 4))+
+  scale_fill_manual(values=c("#ffffff", "#E69F00", "#999999")) +   theme_void() +
+  labs(title = "6th Rolling CV Loop") + theme(plot.title=element_text(hjust=0.5, vjust=0.1, face='bold'))+ guides(fill = guide_legend(reverse = TRUE, title=NULL))
+type <- c('Train(Mar-Nov)','Test(1st-3rd Nov)',' ')
+nums <- c(8,0.4,1)
+df <- data.frame(type = type, nums = nums)
+# Compute percentages
+df$fraction <- df$nums / sum(df$nums)
+# Compute the cumulative percentages (top of each rectangle)
+df$ymax <- cumsum(df$fraction)
+# Compute the bottom of each rectangle
+df$ymin <- c(0, head(df$ymax, n=-1))
+# Compute label position
+df$labelPosition <- (df$ymax + df$ymin) / 2
+# Compute a good label
+df$label <- df$type
+p7 = ggplot(df, aes(ymax=ymax, ymin=ymin, xmax=4, xmin=3, fill=type)) +
+  geom_rect() +
+  coord_polar(theta="y") + # Try to remove that to understand how the chart is built initially
+  xlim(c(2, 4))+
+  scale_fill_manual(values=c("#ffffff", "#E69F00", "#999999")) +   theme_void() +
+  labs(title = "7th Rolling CV Loop") + theme(plot.title=element_text(hjust=0.5, vjust=0.1, face='bold'))+ guides(fill = guide_legend(reverse = TRUE, title=NULL))
+type <- c('Train(Mar-Dec)','Test(1st-3rd Dec)')
+nums <- c(9,0.4)
+df <- data.frame(type = type, nums = nums)
+# Compute percentages
+df$fraction <- df$nums / sum(df$nums)
+# Compute the cumulative percentages (top of each rectangle)
+df$ymax <- cumsum(df$fraction)
+# Compute the bottom of each rectangle
+df$ymin <- c(0, head(df$ymax, n=-1))
+# Compute label position
+df$labelPosition <- (df$ymax + df$ymin) / 2
+# Compute a good label
+df$label <- df$type
+p8 = ggplot(df, aes(ymax=ymax, ymin=ymin, xmax=4, xmin=3, fill=type)) +
+  geom_rect() +
+  coord_polar(theta="y") + # Try to remove that to understand how the chart is built initially
+  xlim(c(2, 4))+
+  scale_fill_manual(values=c("#E69F00", "#999999")) +   theme_void() +
+  labs(title = "8th Rolling CV Loop") + theme(plot.title=element_text(hjust=0.5, vjust=0.1, face='bold'))+ guides(fill = guide_legend(reverse = TRUE, title=NULL))
+p = gridExtra::grid.arrange(p1, p5, p2, p6, p3, p7, p4, p8, nrow=4, ncol=2)
+p
+```
+
+
+
+
+
+
+
+
+<!-- ```{r} -->
+
+<!-- tv_coefficients = full_data[,c("new_cases_smoothed_per_million", "driving", "walking", "flights_in", "flights_out", "location", "date", "reproduction_rate")] -->
+<!-- tv_coefficients = tv_coefficients %>% filter(location %in% countries) %>% filter(date >= "2020-03-01") %>%  -->
+<!--   inner_join(facial_cov_gov) %>%  na.omit() %>%  -->
+<!--   group_by(location) %>%  group_modify(~mutate_if(.x, is.numeric,  wrapLowess,f = 0.05,.x$date )) %>%  -->
+<!--   group_modify(~mutate_if(.x, is.numeric,  normalize )) %>%  -->
+<!--   group_modify(~ tvLM(new_cases_smoothed_per_million ~ driving + walking + flights_in + Facial_Coverings, data = .x, bw = 0.05, est ="ll")$coefficients -->
+<!--                %>% data.frame(date = .x$date, new_cases_smoothed_per_million = .x$new_cases_smoothed_per_million))  -->
+
+<!-- colnames(tv_coefficients) = colnames(tv_coefficients) %>% str_replace_all("_", " ") %>% str_replace_all("smoothed", "")%>%  str_to_title() -->
+
+
+
+<!--      g1 = tv_coefficients %>% filter(Location %in% countries, Date >= input$tv_dates_viz[1] & Date <= input$tv_dates_viz[2]) %>% select(Location, Date , Parameter = input$tv_var) %>% -->
+<!--        ggplot(aes(x = Date, y = Parameter, colour = Location , group = 1)) + -->
+<!--        geom_line() + -->
+<!--        theme_minimal() + -->
+<!--        ylab(input$tv_var) + ggtitle(paste("The Impact of",input$tv_var, "on New Cases Per Million Over Time" )) -->
+
+
+<!--      g2 = tv_coefficients %>% filter(Location %in% input$tv_country, Date >= input$tv_dates_viz[1] & Date <= input$tv_dates_viz[2]) %>% -->
+<!--        select(Location, Date , Parameter = input$tv_var, `New Cases  Per Million`) %>% gather(-Location, -Date, key = "key", value = "value") %>%  -->
+<!--         ggplot(aes(x = Date, y = value, colour = Location , group = 1)) + geom_line() +  -->
+<!--         theme_minimal() + facet_wrap(~key, nrow = 2, scales =  "free_y", -->
+<!--                                      strip.position = "left",  -->
+<!--                                      labeller = as_labeller(c( "New Cases  Per Million" = "New Cases Per Million",Parameter = paste(input$tv_var,"Coefficient")) ))+  ylab(NULL) + -->
+<!--        theme(strip.background = element_blank(), -->
+<!--              strip.placement = "outside") -->
+
+<!-- ``` -->
+
+
+
+
+
+```{r}
+sessionInfo()
+```
+
+
